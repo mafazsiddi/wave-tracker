@@ -1,0 +1,294 @@
+// Prisma Schema for Marketing Dashboard API (Wave Tracker Model)
+
+generator client {
+  provider      = "prisma-client-js"
+  // native = local dev; rhel targets = Vercel serverless runtime (Amazon Linux)
+  binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled connection (Supabase Supavisor :6543) used at runtime
+  directUrl = env("DIRECT_URL")   // direct connection (:5432) used for migrations / db push
+}
+
+// Generic key -> JSON blob store backing the Wave Tracker frontend's
+// window.storage (keys: meta, qdata:<quarter>, comments:<quarter>).
+// Shared across the whole team so everyone sees the same data.
+model KVStore {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+enum Role {
+  ADMIN
+  VIEWER
+}
+
+enum CampaignStatus {
+  DRAFT
+  PLANNED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum MessageType {
+  ANNOUNCEMENT
+  ALERT
+  UPDATE
+  MAINTENANCE
+}
+
+enum MessageStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model User {
+  id          String     @id @default(uuid())
+  email       String     @unique
+  password    String
+  name        String
+  role        Role       @default(VIEWER)
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id])
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  comments    Comment[]
+  auditLogs   AuditLog[]
+}
+
+model Workspace {
+  id        String     @id @default(uuid())
+  name      String
+  slug      String     @unique
+  users     User[]
+  campaigns Campaign[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model WaveMeta {
+  id          String   @id @default("default")
+  quarters    String[] @default(["JAS26", "OND26", "JFM27", "AMJ27"])
+  stageGroups Json     // Mapping of stageGroup -> string[] countries
+  passcode    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model WaveEntry {
+  id          String   @id @default(uuid())
+  quarter     String   @default("JAS26") // JAS26, OND26, JFM27, AMJ27, etc.
+  channel     String   // email, social
+  kind        String   // performance, calendar, copies
+  group       String   // postwave, live, attack, activate, watch, webinar, lifecycle
+  country     String   // Germany, UAE, KSA, France, India, Oman, etc.
+
+  // Common metadata
+  title       String?
+  name        String?
+  date        String?
+  status      String?  // Done, Scheduled, WIP, Cancelled, Active, Paused, Blocker, N/A, Ready, On Hold
+  notes       String?
+
+  // Performance Email Fields
+  subjectLine        String?
+  emailsSent         Float?
+  emailsOpened       Float?
+  emailsUnopened     Float?
+  bounced            Float?
+  softBounce         Float?
+  hardBounce         Float?
+  totalDelivered     Float?
+  deliverabilityRate Float?
+  uniqueClicks       Float?
+  openRate           Float?
+  deliveryRate       Float?
+  htmlOpenRate       Float?
+  ctor               Float?
+  optOuts            Float?
+  attachedLink       String?
+  emailLink          String?
+
+  // Performance Social Fields
+  day            String?
+  slot           Float?
+  bucket         String?
+  contentType    String?
+  link           String?
+  impressions    Float?
+  views          Float?
+  clicks         Float?
+  ctr            Float?
+  likes          Float?
+  commentsCount  Float?
+  reposts        Float?
+  engagementRate Float?
+  cta            String?
+
+  // Calendar Email & Social Fields
+  drip           String?  // Drip / Nurture Track
+  target         String?  // Target / Problem Case
+  emailNum       String?  // # Email
+  purpose        String?  // Email Purpose & Content
+  topic          String?  // Topic
+  accounts       String?  // # Accounts
+  contacts       String?  // # Contacts
+  deploymentDate String?  // Deployment Date
+  plannedDate    String?  // Planned Post Date
+  owner          String?  // Owner
+
+  // Copies Fields
+  copyText       String?  // Copy text content
+  bannerLink     String?  // Banner / Creative Link
+  version        String?  // Version tag
+
+  // Relations
+  comments    WaveComment[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model WaveComment {
+  id        String    @id @default(uuid())
+  entryId   String
+  entry     WaveEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  name      String
+  text      String
+  createdAt DateTime  @default(now())
+}
+
+model Country {
+  id        String     @id @default(uuid())
+  code      String     @unique
+  name      String
+  campaigns Campaign[]
+}
+
+model Stage {
+  id        String     @id @default(uuid())
+  name      String
+  order     Int
+  campaigns Campaign[]
+}
+
+model Campaign {
+  id          String         @id @default(uuid())
+  name        String
+  description String?
+  status      CampaignStatus @default(DRAFT)
+  countryId   String?
+  country     Country?       @relation(fields: [countryId], references: [id])
+  stageId     String?
+  stage       Stage?         @relation(fields: [stageId], references: [id])
+  workspaceId String?
+  workspace   Workspace?     @relation(fields: [workspaceId], references: [id])
+  startDate   DateTime?
+  endDate     DateTime?
+  createdBy   String
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  calendars   Calendar[]
+  copies      Copy[]
+  performance Performance[]
+  comments    Comment[]
+  attachments Attachment[]
+}
+
+model Calendar {
+  id          String   @id @default(uuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  startDate   DateTime
+  endDate     DateTime
+  status      String   @default("SCHEDULED")
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model DashboardMessage {
+  id        String        @id @default(uuid())
+  title     String
+  content   String
+  type      MessageType   @default(ANNOUNCEMENT)
+  status    MessageStatus @default(ACTIVE)
+  priority  Priority      @default(MEDIUM)
+  createdBy String
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+}
+
+model Performance {
+  id          String   @id @default(uuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  impressions Int      @default(0)
+  clicks      Int      @default(0)
+  conversions Int      @default(0)
+  spend       Float    @default(0.0)
+  revenue     Float    @default(0.0)
+  date        DateTime @default(now())
+}
+
+model Copy {
+  id         String   @id @default(uuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  title      String
+  content    String
+  channel    String
+  status     String   @default("DRAFT")
+  createdBy  String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Comment {
+  id         String   @id @default(uuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  content    String
+  createdAt  DateTime @default(now())
+}
+
+model Attachment {
+  id         String   @id @default(uuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  fileName   String
+  fileUrl    String
+  fileType   String
+  uploadedBy String
+  createdAt  DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  details   String?
+  createdAt DateTime @default(now())
+}
