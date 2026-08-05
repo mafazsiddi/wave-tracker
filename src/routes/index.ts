@@ -5,7 +5,6 @@ import kvRoutes from './kv.routes';
 import hubspotRoutes from './hubspot.routes';
 import instantlyRoutes from './instantly.routes';
 import cronRoutes from './cron.routes';
-import debugRoutes from './debug.routes';
 
 const router = Router();
 
@@ -17,6 +16,5 @@ router.use('/kv', kvRoutes);
 router.use('/hubspot', hubspotRoutes);
 router.use('/instantly', instantlyRoutes);
 router.use('/cron', cronRoutes);
-router.use('/debug', debugRoutes);
 
 export default router;
