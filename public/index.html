@@ -56,7 +56,7 @@
   .card .arc{position:absolute;top:14px;right:14px;width:26px;height:26px;border-radius:50%;border:2px solid var(--accent);opacity:.35;}
   .card.add{border-style:dashed;display:flex;align-items:center;justify-content:center;color:var(--muted);font-weight:600;}
   .card.add:hover{color:var(--accent-dark);border-color:var(--accent);}
-  .del-x{position:absolute;top:10px;right:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;opacity:.5;}
+  .del-x{position:absolute;top:16px;right:15px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;opacity:.5;}
   .del-x:hover{opacity:1;color:var(--attack);}
 
   .bignav{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:8px;}
@@ -258,6 +258,11 @@ window.storage = window.storage || {
 };
 
 const SEED_REVISION = 'jas26-copies-2026-07-28';
+
+// The edit PIN is NOT stored here — it lives only on the server (EDIT_PIN env
+// var) and is checked via POST /api/access/verify. That keeps it out of the
+// page source, dev tools, and network payloads entirely.
+// Editing rights: Shweta & Gourav. View-only: whole marketing team / link.
 const STAGE_META = {
   postwave: {label:"Post Wave", color:"var(--postwave)"},
   live: {label:"Live", color:"var(--live)"},
@@ -571,10 +576,11 @@ async function loadAll(){
   // (untouched in storage), just no longer shown as a selectable quarter.
   meta.quarters = meta.quarters.filter(q => q !== "AMJ'26");
 
-  // Future quarters on the roadmap - no data yet, just make sure they exist as
-  // selectable quarters so the team can start logging into them directly.
+  // Only JAS'26 is active for now (marketing: "JAS'26, then add quarter-wise").
+  // Drop the future roadmap quarters that older sessions auto-added; editors add
+  // new quarters via "+ Add quarter" when each one actually starts.
   for(const q of ["OND'26","JFM'27","AMJ'27"]){
-    if(!meta.quarters.includes(q)) meta.quarters.push(q);
+    meta.quarters = meta.quarters.filter(x => x !== q);
   }
 
   // Render right away with what's in memory - this never waits on a network write.
@@ -691,28 +697,35 @@ function customAlert(message){
 
 function el(html){ const d=document.createElement('div'); d.innerHTML=html; return d.firstElementChild; }
 
-async function toggleEdit(){
-  if(editMode){ editMode = false; render(); return; }
-  if(!meta.passcode){
-    const p1 = await customPrompt("Set an edit PIN for this tracker (share it only with people who should edit):", '', true);
-    if(!p1) return;
-    meta.passcode = p1;
-    await saveMeta();
-    editMode = true; render(); return;
+// Guard for mutation handlers: even though edit controls are hidden in
+// view-only mode, this stops any edit action from firing if a control is
+// somehow reached (stale DOM, devtools, etc.).
+function requireEdit(){
+  if(!editMode){
+    customAlert('You are in view-only mode. Click "🔒 View only" (top-right) and enter the edit PIN to make changes.');
+    return false;
   }
-  const p = await customPrompt("Enter edit PIN:", '', true);
-  if(p === meta.passcode){ editMode = true; render(); }
-  else if(p !== null) await customAlert("Wrong PIN.");
-  render();
+  return true;
 }
 
-async function resetPasscode(){
-  const ok = await customConfirm("Reset the edit PIN? Anyone with the tracker link will be able to set a brand-new PIN right after this, so only do this if you're the one who'll set it next.");
-  if(!ok) return;
-  meta.passcode = null;
-  await saveMeta();
-  await customAlert("PIN reset. Click \"View only\" again to set a new PIN.");
-  render();
+async function toggleEdit(){
+  if(editMode){ editMode = false; render(); return; }
+  // PIN is verified on the SERVER — it never exists in this page. There is no
+  // set/reset flow, so no viewer can change or clear it.
+  const p = await customPrompt("Enter edit PIN:", '', true);
+  if(p === null) return; // cancelled
+  try{
+    const r = await fetch('/api/access/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: p })
+    });
+    const j = await r.json();
+    if(j && j.ok){ editMode = true; render(); }
+    else await customAlert("Wrong PIN.");
+  }catch(e){
+    await customAlert("Couldn't verify the PIN — make sure you're on the app server (http://localhost:5000), not a static preview. ("+e.message+")");
+  }
 }
 
 // A tracker that's already been opened once has its own storage, seeded
@@ -811,7 +824,6 @@ function topbar(){
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
       <button class="src-navbtn" data-nav="sources">🔌 Data sources</button>
-      ${(!editMode && meta.passcode)? `<button data-action="reset-passcode" style="background:none;border:none;color:var(--muted);font-size:12px;cursor:pointer;text-decoration:underline;">Forgot PIN?</button>`:''}
       ${editMode? `<button data-action="sync-seed" style="background:#fff;border:1px solid var(--line);color:var(--muted);font-size:12px;cursor:pointer;padding:6px 10px;border-radius:99px;">🔄 Sync latest data</button>`:''}
       <button class="edit-toggle ${editMode?'on':'off'}" data-action="toggle-edit">${editMode? '🔓 Editing on' : '🔒 View only'}</button>
     </div>
@@ -1153,11 +1165,11 @@ function commentsBoxInner(e, comments){
   const c = comments[e.id] || [];
   return `<div class="comments-box">
       ${c.length? c.map(cm=>`<div class="comment"><b>${esc(cm.author)}:</b> ${esc(cm.text)}<span class="ts">${new Date(cm.ts).toLocaleString()}</span></div>`).join('') : '<div class="comment" style="color:var(--muted)">No comments yet.</div>'}
-      <div class="comment-form">
+      ${editMode ? `<div class="comment-form">
         <input class="name" placeholder="Your name" data-role="comment-name" data-id="${e.id}" value="${esc(commenterName)}">
         <input placeholder="Add a comment…" data-role="comment-text" data-id="${e.id}">
         <button class="btn small" data-action="add-comment" data-id="${e.id}">Post</button>
-      </div>
+      </div>` : `<div class="comment" style="color:var(--muted);font-style:italic;">🔒 View-only — turn on Editing to comment.</div>`}
     </div>`;
 }
 
@@ -1169,21 +1181,6 @@ function rowCommentsBlock(e, comments, colspan){
   </td></tr>`;
 }
 
-function _rowCommentsBlockOld(e, comments, colspan){
-  const c = comments[e.id] || [];
-  const open = !!state.openComments[e.id];
-  if(!open) return '';
-  return `<tr><td colspan="${colspan}" style="background:var(--bg);">
-    <div class="comments-box">
-      ${c.length? c.map(cm=>`<div class="comment"><b>${esc(cm.author)}:</b> ${esc(cm.text)}<span class="ts">${new Date(cm.ts).toLocaleString()}</span></div>`).join('') : '<div class="comment" style="color:var(--muted)">No comments yet.</div>'}
-      <div class="comment-form">
-        <input class="name" placeholder="Your name" data-role="comment-name" data-id="${e.id}" value="${esc(commenterName)}">
-        <input placeholder="Add a comment…" data-role="comment-text" data-id="${e.id}">
-        <button class="btn small" data-action="add-comment" data-id="${e.id}">Post</button>
-      </div>
-    </div>
-  </td></tr>`;
-}
 
 // Renders a value as a real clickable link when it looks like a URL, so
 // tracked links and report URLs can be opened directly instead of just read.
@@ -1528,8 +1525,6 @@ function bindEvents(){
   const editBtn = app.querySelector('[data-action="toggle-edit"]');
   if(editBtn) editBtn.addEventListener('click', toggleEdit);
 
-  const resetPinBtn = app.querySelector('[data-action="reset-passcode"]');
-  if(resetPinBtn) resetPinBtn.addEventListener('click', resetPasscode);
 
   const syncBtn = app.querySelector('[data-action="sync-seed"]');
   if(syncBtn) syncBtn.addEventListener('click', syncSeedData);
@@ -1539,6 +1534,7 @@ function bindEvents(){
 
   const addQ = app.querySelector('[data-action="add-quarter"]');
   if(addQ) addQ.addEventListener('click', async ()=>{
+    if(!requireEdit()) return;
     const name = await customPrompt("Quarter code (e.g. JAS'26):");
     if(!name) return;
     if(!meta.quarters.includes(name)){ meta.quarters.push(name); await saveMeta(); }
@@ -1548,6 +1544,7 @@ function bindEvents(){
   app.querySelectorAll('[data-action="del-quarter"]').forEach(b=>{
     b.addEventListener('click', async (ev)=>{
       ev.stopPropagation();
+      if(!requireEdit()) return;
       const ok = await customConfirm(`Delete quarter "${b.dataset.q}" and all its data?`);
       if(!ok) return;
       meta.quarters = meta.quarters.filter(q=>q!==b.dataset.q);
@@ -1559,6 +1556,7 @@ function bindEvents(){
 
   const addCountryBtn = app.querySelector('[data-action="add-country"]');
   if(addCountryBtn) addCountryBtn.addEventListener('click', async ()=>{
+    if(!requireEdit()) return;
     const input = app.querySelector('[data-role="new-country"]');
     const val = input.value.trim();
     if(!val) return;
@@ -1593,7 +1591,7 @@ function bindEvents(){
   });
 
   const addEntryBtn = app.querySelector('[data-action="add-entry"]');
-  if(addEntryBtn) addEntryBtn.addEventListener('click', ()=>{ state.modal = {entry:null}; render(); });
+  if(addEntryBtn) addEntryBtn.addEventListener('click', ()=>{ if(!requireEdit()) return; state.modal = {entry:null}; render(); });
 
   async function pullFromSource(btn, source){
     const q = state.quarter;
@@ -1622,6 +1620,7 @@ function bindEvents(){
 
   app.querySelectorAll('[data-action="edit-entry"]').forEach(b=>{
     b.addEventListener('click', async ()=>{
+      if(!requireEdit()) return;
       const data = await loadQData(state.quarter);
       const entry = data.entries.find(e=>e.id===b.dataset.id);
       state.modal = {entry};
@@ -1631,6 +1630,7 @@ function bindEvents(){
 
   app.querySelectorAll('[data-action="del-entry"]').forEach(b=>{
     b.addEventListener('click', async ()=>{
+      if(!requireEdit()) return;
       const ok = await customConfirm("Delete this entry?");
       if(!ok) return;
       const data = await loadQData(state.quarter);
@@ -1649,6 +1649,7 @@ function bindEvents(){
 
   app.querySelectorAll('[data-action="add-comment"]').forEach(b=>{
     b.addEventListener('click', async ()=>{
+      if(!requireEdit()) return;
       const id = b.dataset.id;
       const nameInput = app.querySelector(`[data-role="comment-name"][data-id="${id}"]`);
       const textInput = app.querySelector(`[data-role="comment-text"][data-id="${id}"]`);
@@ -1672,6 +1673,7 @@ function bindEvents(){
 
   const saveBtn = app.querySelector('[data-action="modal-save"]');
   if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    if(!requireEdit()) return;
     const fields = FIELD_SETS[fieldKey()];
     const vals = {};
     fields.forEach(f=>{

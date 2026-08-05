@@ -16,6 +16,10 @@ const envSchema = z.object({
   // an `x-sync-secret` header (used by Vercel Cron). Left empty = endpoint open
   // (consistent with the rest of this internal tool).
   SYNC_SECRET: z.string().optional().default(''),
+  // Master edit PIN for the Wave Tracker. Lives ONLY on the server — never sent
+  // to the browser — so it can't be read from view-source / inspect element.
+  // Editors (Shweta & Gourav) type it; the frontend verifies via /api/access/verify.
+  EDIT_PIN: z.string().optional().default('wave2026'),
 });
 
 export const env = envSchema.parse(process.env);
