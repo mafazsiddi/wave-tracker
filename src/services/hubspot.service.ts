@@ -41,7 +41,9 @@ const num = (v: unknown): number => {
   const n = typeof v === 'string' ? parseFloat(v) : (v as number);
   return Number.isFinite(n) ? n : 0;
 };
-const pct = (v: unknown): number => Math.round(num(v) * 1000) / 10; // 0.42 -> 42.0
+// HubSpot's ratio fields (openratio, deliveredratio, ...) are already percentages
+// (e.g. 2.347 means 2.347%), not 0-1 fractions — just round to 1 decimal.
+const pct = (v: unknown): number => Math.round(num(v) * 10) / 10;
 
 /** Verify the token works and report which portal it belongs to. */
 export async function getAccountInfo(): Promise<{ portalId: number; timeZone?: string; uiDomain?: string }> {

@@ -10,10 +10,16 @@ export interface SyncMeta {
   [k: string]: any;
 }
 
+// 'webinar' and 'lifecycle' are separate nurture-tab overlays, not journey
+// stages — they list nearly every country and would clobber the real stage
+// (postwave/live/attack/activate/watch) if included here.
+const NON_STAGE_GROUPS = new Set(['webinar', 'lifecycle']);
+
 /** Build country -> stage-group lookup from the dashboard's meta.stageGroups. */
 export function buildCountryToGroup(meta: SyncMeta): Map<string, string> {
   const map = new Map<string, string>();
   for (const [group, countries] of Object.entries(meta.stageGroups ?? {})) {
+    if (NON_STAGE_GROUPS.has(group)) continue;
     for (const c of countries || []) map.set(c, group);
   }
   return map;
