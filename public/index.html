@@ -105,7 +105,7 @@
   .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;border-bottom:1px solid var(--line);padding-bottom:14px;}
   .tab{padding:8px 16px;border-radius:99px;background:var(--surface);border:1px solid var(--line);font-size:13px;font-weight:600;cursor:pointer;color:var(--muted);transition:all .12s;}
   .tab.active{background:linear-gradient(120deg,var(--accent-dark),var(--accent));color:#fff;border-color:transparent;box-shadow:0 4px 10px rgba(22,120,251,.28);}
-  .tab .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;position:relative;top:-1px;}
+  .tab .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;position:relative;top:-1px;background:var(--muted);}
 
   .stagegroup-tabs .tab[data-g="postwave"] .dot{background:var(--postwave);}
   .stagegroup-tabs .tab[data-g="live"] .dot{background:var(--live);}
@@ -281,7 +281,10 @@ const DEFAULT_META = {
   },
   passcode: null,
   hiddenStages: [],
-  removedCountries: {}
+  removedCountries: {},
+  customStages: {},
+  customRegions: [],
+  marketRegionOverrides: {}
 };
 
 
@@ -508,18 +511,32 @@ function mergeMetaWithDefaults(loaded){
   // the loop below always starts from DEFAULT_META's full list.
   const removedCountries = (merged.removedCountries && typeof merged.removedCountries === 'object') ? merged.removedCountries : {};
 
+  // Waves/stages an editor has added themselves, beyond the fixed default
+  // set (label only - color falls back to a neutral dot). Kept separate
+  // from DEFAULT_META so the loop below knows which stages have no "base"
+  // list to rebuild from.
+  merged.customStages = (merged.customStages && typeof merged.customStages === 'object') ? merged.customStages : {};
+
   merged.stageGroups = {};
-  for(const g of Object.keys(DEFAULT_META.stageGroups)){
+  const allStageKeys = new Set([...Object.keys(DEFAULT_META.stageGroups), ...Object.keys(merged.customStages)]);
+  for(const g of allStageKeys){
     const removedHere = new Set(Array.isArray(removedCountries[g]) ? removedCountries[g] : []);
-    const base = DEFAULT_META.stageGroups[g].filter(c=>!removedHere.has(c));
+    const isDefaultStage = Object.prototype.hasOwnProperty.call(DEFAULT_META.stageGroups, g);
+    const base = isDefaultStage ? DEFAULT_META.stageGroups[g].filter(c=>!removedHere.has(c)) : [];
     const old = Array.isArray(oldGroups[g]) ? oldGroups[g] : [];
     // Keep only genuinely custom countries the person added themselves - ones
     // that don't belong to any recognized default group anywhere else, and
-    // aren't on the deprecated list.
+    // aren't on the deprecated list. Custom (non-default) stages have no
+    // "recognized default" countries at all, so everything saved under them
+    // is kept as-is (minus removed/deprecated).
     for(const c of old){
       if(DEPRECATED_COUNTRIES.has(c)) continue;
       if(removedHere.has(c)) continue;
-      if(!allDefaultCountries.has(c) && !base.includes(c)) base.push(c);
+      if(isDefaultStage){
+        if(!allDefaultCountries.has(c) && !base.includes(c)) base.push(c);
+      } else if(!base.includes(c)){
+        base.push(c);
+      }
     }
     merged.stageGroups[g] = base;
   }
@@ -527,6 +544,8 @@ function mergeMetaWithDefaults(loaded){
 
   if(typeof merged.passcode === 'undefined') merged.passcode = null;
   if(!Array.isArray(merged.hiddenStages)) merged.hiddenStages = [];
+  if(!Array.isArray(merged.customRegions)) merged.customRegions = [];
+  if(!merged.marketRegionOverrides || typeof merged.marketRegionOverrides !== 'object') merged.marketRegionOverrides = {};
   return merged;
 }
 
@@ -950,7 +969,7 @@ function crumbs(){
   }
   if(state.group){
     parts.push(`<span class="sep">/</span>`);
-    parts.push(`<span class="current">${STAGE_META[state.group].label}${state.country? ' · '+esc(state.country):''}</span>`);
+    parts.push(`<span class="current">${allStageMeta()[state.group].label}${state.country? ' · '+esc(state.country):''}</span>`);
   }
   return `<div class="crumbs">${parts.join('')}</div>`;
 }
@@ -1167,7 +1186,30 @@ const WEBINAR_REGION_MAP = {
   'Global e-invoicing':'Global','Global e-Invoicing':'Global'
 };
 const WEBINAR_REGION_ORDER = ['GCC','EU','SEA','India','Global','Other'];
-function webinarRegion(market){ return WEBINAR_REGION_MAP[market] || 'Other'; }
+
+// Effective region order = fixed defaults + any editor-added regions,
+// always with "Other" last (the catch-all for unmapped markets).
+function regionOrder(){
+  const base = WEBINAR_REGION_ORDER.filter(r=>r!=='Other');
+  const custom = (meta.customRegions||[]).filter(r=>!base.includes(r));
+  return [...base, ...custom, 'Other'];
+}
+
+function webinarRegion(market){
+  if(meta.marketRegionOverrides && meta.marketRegionOverrides[market]) return meta.marketRegionOverrides[market];
+  return WEBINAR_REGION_MAP[market] || 'Other';
+}
+
+function regionTabsHtml(navType, current, regionCounts, totalCount){
+  const manageBtn = editMode ? `<button class="btn ghost small" data-action="manage-regions" style="margin-left:6px;">⚙ Regions</button>` : '';
+  return `<div class="tabs country-tabs" style="align-items:center;">
+    <button class="tab ${(!current||current==='all')?'active':''}" data-nav="${navType}" data-r="all">All (${totalCount})</button>
+    ${regionOrder().filter(r=>regionCounts[r]).map(r=>
+      `<button class="tab ${current===r?'active':''}" data-nav="${navType}" data-r="${r}">${esc(r)} (${regionCounts[r]})</button>`
+    ).join('')}
+    ${manageBtn}
+  </div>`;
+}
 
 function webinarMonthKey(dateStr){
   if(!dateStr || dateStr.length<7) return 'zzz-no-date';
@@ -1195,8 +1237,8 @@ function renderWebinarTable(shown){
     const rows = byMonth.get(mk).slice().sort((a,b)=>{
       const da = a.date||'', db = b.date||'';
       if(da!==db) return da<db? -1:1;
-      const ra = WEBINAR_REGION_ORDER.indexOf(webinarRegion(a.market));
-      const rb = WEBINAR_REGION_ORDER.indexOf(webinarRegion(b.market));
+      const ra = regionOrder().indexOf(webinarRegion(a.market));
+      const rb = regionOrder().indexOf(webinarRegion(b.market));
       if(ra!==rb) return ra-rb;
       return (a.market||'').localeCompare(b.market||'');
     });
@@ -1270,17 +1312,11 @@ async function renderWebinarView(){
 
   const regionCounts = {};
   for(const e of weekFiltered){ const r = webinarRegion(e.market); regionCounts[r] = (regionCounts[r]||0)+1; }
-  const regionTabs = `<div class="tabs country-tabs">
-    <button class="tab ${(!state.webinarRegion||state.webinarRegion==='all')?'active':''}" data-nav="webinar-region" data-r="all">All (${weekFiltered.length})</button>
-    ${WEBINAR_REGION_ORDER.filter(r=>regionCounts[r]).map(r=>
-      `<button class="tab ${state.webinarRegion===r?'active':''}" data-nav="webinar-region" data-r="${r}">${esc(r)} (${regionCounts[r]})</button>`
-    ).join('')}
-  </div>`;
 
   return `${topbar()}${crumbs()}
   <h2 class="pagetitle">Webinar Calendar</h2>
   <p class="pagesub">${esc(state.quarter)} · grouped by month, sorted by region within each month</p>
-  ${regionTabs}
+  ${regionTabsHtml('webinar-region', state.webinarRegion, regionCounts, weekFiltered.length)}
   ${quickStats}
   <div class="toolbar">
     <input class="search" placeholder="Filter…" value="${esc(state.search)}" data-role="search">
@@ -1375,12 +1411,6 @@ async function renderWebinarPerformanceView(){
     ? list.filter(e => webinarRegion(e.market) === state.webinarPerfRegion)
     : list;
   const shown = filterEntries(regionFiltered);
-  const perfRegionTabs = `<div class="tabs country-tabs">
-    <button class="tab ${(!state.webinarPerfRegion||state.webinarPerfRegion==='all')?'active':''}" data-nav="webinar-perf-region" data-r="all">All (${list.length})</button>
-    ${WEBINAR_REGION_ORDER.filter(r=>regionCounts[r]).map(r=>
-      `<button class="tab ${state.webinarPerfRegion===r?'active':''}" data-nav="webinar-perf-region" data-r="${r}">${esc(r)} (${regionCounts[r]})</button>`
-    ).join('')}
-  </div>`;
 
   const cardsHtml = shown.length ? `<div class="grid">${shown.map(e=>{
     const region = webinarRegion(e.market);
@@ -1405,9 +1435,10 @@ async function renderWebinarPerformanceView(){
     <button class="tab ${state.webinarPerfTab!=='upcoming'?'active':''}" data-nav="webinar-perf-tab" data-t="past">✅ Past (${past.length})</button>
     <button class="tab ${state.webinarPerfTab==='upcoming'?'active':''}" data-nav="webinar-perf-tab" data-t="upcoming">🔜 Upcoming (${upcoming.length})</button>
   </div>
-  ${perfRegionTabs}
+  ${regionTabsHtml('webinar-perf-region', state.webinarPerfRegion, regionCounts, list.length)}
   <div class="toolbar">
     <input class="search" placeholder="Filter…" value="${esc(state.search)}" data-role="search">
+    ${editMode? `<button class="btn" data-action="add-webinar-entry">+ Add webinar</button>`:''}
   </div>
   ${cardsHtml}`;
 }
@@ -1650,12 +1681,6 @@ async function renderWebinarExecutionView(){
   const regionFiltered = (!state.webinarExecRegion || state.webinarExecRegion==='all')
     ? weekFiltered
     : weekFiltered.filter(e => webinarRegion(e.market) === state.webinarExecRegion);
-  const execRegionTabs = `<div class="tabs country-tabs">
-    <button class="tab ${(!state.webinarExecRegion||state.webinarExecRegion==='all')?'active':''}" data-nav="webinar-exec-region" data-r="all">All (${weekFiltered.length})</button>
-    ${WEBINAR_REGION_ORDER.filter(r=>regionCounts[r]).map(r=>
-      `<button class="tab ${state.webinarExecRegion===r?'active':''}" data-nav="webinar-exec-region" data-r="${r}">${esc(r)} (${regionCounts[r]})</button>`
-    ).join('')}
-  </div>`;
 
   const shown = filterEntries(regionFiltered);
   const cardsHtml = shown.length ? `<div class="grid">${shown.map(e=>{
@@ -1681,13 +1706,14 @@ async function renderWebinarExecutionView(){
     <button class="tab ${state.webinarExecTab!=='past'?'active':''}" data-nav="webinar-exec-tab" data-t="upcoming">🔜 Upcoming (${upcoming.length})</button>
     <button class="tab ${state.webinarExecTab==='past'?'active':''}" data-nav="webinar-exec-tab" data-t="past">✅ Past (${past.length})</button>
   </div>
-  ${execRegionTabs}
+  ${regionTabsHtml('webinar-exec-region', state.webinarExecRegion, regionCounts, weekFiltered.length)}
   <div class="toolbar">
     <input class="search" placeholder="Filter…" value="${esc(state.search)}" data-role="search">
     ${weeks.length? `<select class="search" style="max-width:220px;" data-role="week-filter" title="Filter by week">
       <option value="all"${(!state.weekFilter||state.weekFilter==='all')?' selected':''}>All weeks</option>
       ${weeks.map(w=>`<option value="${w.key}"${state.weekFilter===w.key?' selected':''}>${esc(w.label)}</option>`).join('')}
     </select>` : ''}
+    ${editMode? `<button class="btn" data-action="add-webinar-entry">+ Add webinar</button>`:''}
   </div>
   ${cardsHtml}`;
 }
@@ -1783,8 +1809,6 @@ function renderWebinarExecutionDetail(e){
   </div>`;
 }
 
-const WEBINAR_COPIES_REGION_ORDER = WEBINAR_REGION_ORDER;
-
 async function renderWebinarCopiesView(){
   const data = await loadQData(state.quarter);
   const fields = FIELD_SETS.copies_webinar;
@@ -1801,12 +1825,6 @@ async function renderWebinarCopiesView(){
   const regionFiltered = (!state.webinarCopiesRegion || state.webinarCopiesRegion==='all')
     ? entries
     : entries.filter(e => webinarRegion(e.audience) === state.webinarCopiesRegion);
-  const copiesRegionTabs = `<div class="tabs country-tabs">
-    <button class="tab ${(!state.webinarCopiesRegion||state.webinarCopiesRegion==='all')?'active':''}" data-nav="webinar-copies-region" data-r="all">All (${entries.length})</button>
-    ${WEBINAR_COPIES_REGION_ORDER.filter(r=>regionCounts[r]).map(r=>
-      `<button class="tab ${state.webinarCopiesRegion===r?'active':''}" data-nav="webinar-copies-region" data-r="${r}">${esc(r)} (${regionCounts[r]})</button>`
-    ).join('')}
-  </div>`;
 
   const shown = filterEntries(regionFiltered);
   const comments = await loadComments(state.quarter);
@@ -1817,7 +1835,7 @@ async function renderWebinarCopiesView(){
   return `${topbar()}${crumbs()}
   <h2 class="pagetitle">Webinar Copies</h2>
   <p class="pagesub">${esc(state.quarter)} · invite sequences, reminders &amp; follow-ups for every webinar</p>
-  ${copiesRegionTabs}
+  ${regionTabsHtml('webinar-copies-region', state.webinarCopiesRegion, regionCounts, entries.length)}
   <div class="toolbar">
     <input class="search" placeholder="Filter…" value="${esc(state.search)}" data-role="search">
     ${editMode? `<button class="btn" data-action="add-entry">+ Add copy</button>`:''}
@@ -1885,15 +1903,28 @@ function renderWebinarCards(shown, comments){
   return html + '</div>';
 }
 
+function allStageMeta(){
+  const out = {...STAGE_META};
+  for(const k of Object.keys(meta.customStages||{})){
+    if(!out[k]) out[k] = {label: meta.customStages[k].label};
+  }
+  return out;
+}
+
 function stageGroupTabs(){
-  const hidden = (meta.hiddenStages||[]).filter(g=>STAGE_META[g]);
-  const visible = Object.keys(STAGE_META).filter(g=>!hidden.includes(g));
+  const stages = allStageMeta();
+  const hidden = (meta.hiddenStages||[]).filter(g=>stages[g]);
+  const visible = Object.keys(stages).filter(g=>!hidden.includes(g));
   const restoreRow = (editMode && hidden.length) ? `<div class="tabs stagegroup-tabs" style="border-bottom:none;padding-bottom:0;margin-bottom:10px;">
-      ${hidden.map(g=>`<button class="btn ghost small" data-action="restore-stage" data-g="${g}" title="Restore this stage">↺ ${esc(STAGE_META[g].label)}</button>`).join('')}
+      ${hidden.map(g=>`<button class="btn ghost small" data-action="restore-stage" data-g="${g}" title="Restore this stage">↺ ${esc(stages[g].label)}</button>`).join('')}
     </div>` : '';
+  let addForm = editMode ? `<span class="add-country-form">
+      <input type="text" placeholder="+ wave" data-role="new-stage">
+      <button class="btn small" data-action="add-stage">Add</button>
+    </span>` : '';
   return `<div class="tabs stagegroup-tabs">${visible.map(g=>
-    `<span class="tab-item"><button class="tab ${state.group===g?'active':''}" data-nav="group" data-g="${g}"><span class="dot"></span>${STAGE_META[g].label}</button>${editMode?`<button class="tab-del" data-action="del-stage" data-g="${g}" title="Remove this stage tab">🗑️</button>`:''}</span>`
-  ).join('')}</div>${restoreRow}`;
+    `<span class="tab-item"><button class="tab ${state.group===g?'active':''}" data-nav="group" data-g="${g}"><span class="dot"></span>${stages[g].label}</button>${editMode?`<button class="tab-del" data-action="del-stage" data-g="${g}" title="Remove this stage tab">🗑️</button>`:''}</span>`
+  ).join('')}${addForm}</div>${restoreRow}`;
 }
 
 function countryTabs(){
@@ -1917,7 +1948,7 @@ async function renderSectionGroupPicker(){
 
 async function renderCountryPicker(){
   return `${topbar()}${crumbs()}
-  <h2 class="pagetitle">${SECTION_LABEL[state.section]} — ${STAGE_META[state.group].label}</h2>
+  <h2 class="pagetitle">${SECTION_LABEL[state.section]} — ${allStageMeta()[state.group].label}</h2>
   <p class="pagesub">Choose a country.</p>
   ${stageGroupTabs()}
   ${countryTabs()}
@@ -2001,7 +2032,7 @@ async function renderDataView(){
 
   return `${topbar()}${crumbs()}
   <h2 class="pagetitle">${SECTION_LABEL[state.section]} — ${esc(state.country)}</h2>
-  <p class="pagesub">${CHANNEL_LABEL[state.channel]} · ${STAGE_META[state.group].label} · ${esc(state.quarter)}</p>
+  <p class="pagesub">${CHANNEL_LABEL[state.channel]} · ${allStageMeta()[state.group].label} · ${esc(state.quarter)}</p>
   ${stageGroupTabs()}
   ${countryTabs()}
   ${quickStats}
@@ -2534,6 +2565,35 @@ function webinarExecModal(entry){
   </div>`;
 }
 
+function regionManageModal(){
+  const order = regionOrder();
+  const markets = state.regionModalMarkets || [];
+  const rows = markets.map(m=>`
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+      <div style="flex:1;font-size:13px;">${esc(m)}</div>
+      <select data-role="market-region" data-market="${esc(m)}" style="max-width:160px;">
+        ${order.map(r=>`<option value="${esc(r)}" ${webinarRegion(m)===r?'selected':''}>${esc(r)}</option>`).join('')}
+      </select>
+    </div>`).join('');
+  return `<div class="modal-bg" data-action="region-modal-bg">
+    <div class="modal" data-stop style="max-width:520px;">
+      <h3>Manage webinar regions</h3>
+      <div class="field">
+        <label>New region name</label>
+        <div style="display:flex;gap:8px;">
+          <input type="text" data-role="new-region" placeholder="e.g. LatAm">
+          <button class="btn small" data-action="add-region" style="flex-shrink:0;">Add</button>
+        </div>
+      </div>
+      <div class="field"><label>Assign each market to a region</label></div>
+      ${rows || '<div class="empty" style="padding:10px 0;">No webinar markets found yet in this quarter.</div>'}
+      <div class="modal-actions">
+        <button class="btn" data-action="region-modal-close">Done</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 async function render(){
   const app = document.getElementById('app');
   let html;
@@ -2557,6 +2617,9 @@ async function render(){
   }
   if(state.webinarExecModal){
     html += webinarExecModal(state.webinarExecModal);
+  }
+  if(state.regionModal){
+    html += regionManageModal();
   }
   app.innerHTML = html;
   document.getElementById('sidebar').innerHTML = renderSidebar();
@@ -2670,7 +2733,8 @@ function bindEvents(){
     b.addEventListener('click', async (ev)=>{
       ev.stopPropagation();
       const g = b.dataset.g;
-      const label = STAGE_META[g] ? STAGE_META[g].label : g;
+      const stages = allStageMeta();
+      const label = stages[g] ? stages[g].label : g;
       const ok = await customConfirm(`Remove the "${label}" stage tab?\n\nIts existing entries stay saved in the background — restore it anytime with the ↺ button.`);
       if(!ok) return;
       if(!Array.isArray(meta.hiddenStages)) meta.hiddenStages = [];
@@ -2687,6 +2751,26 @@ function bindEvents(){
       await saveMeta();
       render();
     });
+  });
+
+  const addStageBtn = app.querySelector('[data-action="add-stage"]');
+  if(addStageBtn) addStageBtn.addEventListener('click', async ()=>{
+    const input = app.querySelector('[data-role="new-stage"]');
+    const label = input.value.trim();
+    if(!label) return;
+    let key = label.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'') || 'wave';
+    const taken = new Set([...Object.keys(STAGE_META), ...Object.keys(meta.customStages||{})]);
+    if(taken.has(key)){
+      let n = 2;
+      while(taken.has(`${key}_${n}`)) n++;
+      key = `${key}_${n}`;
+    }
+    if(!meta.customStages) meta.customStages = {};
+    meta.customStages[key] = {label};
+    if(!meta.stageGroups[key]) meta.stageGroups[key] = [];
+    meta.hiddenStages = (meta.hiddenStages||[]).filter(g=>g!==key);
+    await saveMeta();
+    render();
   });
 
   const searchInput = app.querySelector('[data-role="search"]');
@@ -2871,6 +2955,54 @@ function bindEvents(){
     await saveQData(state.quarter);
     state.webinarExecModal = null;
     render();
+  });
+
+  const addWebinarEntryBtn = app.querySelector('[data-action="add-webinar-entry"]');
+  if(addWebinarEntryBtn) addWebinarEntryBtn.addEventListener('click', ()=>{
+    // Reuse the Calendar section's generic add-entry modal (FIELD_SETS.calendar_webinar)
+    // so a brand-new webinar can be logged directly from Performance/Execution too,
+    // instead of requiring a detour through the Calendar tab first.
+    state.section = 'calendar';
+    state.modal = {entry:null};
+    render();
+  });
+
+  const manageRegionsBtn = app.querySelector('[data-action="manage-regions"]');
+  if(manageRegionsBtn) manageRegionsBtn.addEventListener('click', async ()=>{
+    const data = await loadQData(state.quarter);
+    const marketsSet = new Set();
+    data.entries.filter(e=>e.channel==='webinar' && e.kind==='calendar' && e.market).forEach(e=>marketsSet.add(e.market));
+    data.entries.filter(e=>e.channel==='webinar' && e.kind==='copies' && e.audience).forEach(e=>marketsSet.add(e.audience));
+    Object.keys(meta.marketRegionOverrides||{}).forEach(m=>marketsSet.add(m));
+    state.regionModalMarkets = Array.from(marketsSet).sort();
+    state.regionModal = true;
+    render();
+  });
+
+  const regionModalBg = app.querySelector('[data-action="region-modal-bg"]');
+  if(regionModalBg) regionModalBg.addEventListener('click', (ev)=>{ if(ev.target===regionModalBg){ state.regionModal=false; render(); } });
+
+  const regionModalClose = app.querySelector('[data-action="region-modal-close"]');
+  if(regionModalClose) regionModalClose.addEventListener('click', ()=>{ state.regionModal=false; render(); });
+
+  const addRegionBtn = app.querySelector('[data-action="add-region"]');
+  if(addRegionBtn) addRegionBtn.addEventListener('click', async ()=>{
+    const input = app.querySelector('[data-role="new-region"]');
+    const name = input.value.trim();
+    if(!name) return;
+    if(!meta.customRegions) meta.customRegions = [];
+    if(!regionOrder().includes(name)) meta.customRegions.push(name);
+    await saveMeta();
+    render();
+  });
+
+  app.querySelectorAll('[data-role="market-region"]').forEach(sel=>{
+    sel.addEventListener('change', async ()=>{
+      if(!meta.marketRegionOverrides) meta.marketRegionOverrides = {};
+      meta.marketRegionOverrides[sel.dataset.market] = sel.value;
+      await saveMeta();
+      render();
+    });
   });
 }
 
