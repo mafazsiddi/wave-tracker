@@ -219,6 +219,9 @@
 
   .add-country-form{display:flex;gap:6px;margin-left:6px;}
   .add-country-form input{padding:8px 10px;border:1px solid var(--line);border-radius:99px;font-size:12px;width:120px;}
+  .tab-item{display:inline-flex;align-items:center;gap:2px;}
+  .tab-del{background:none;border:none;cursor:pointer;font-size:12px;padding:2px 5px;color:var(--muted);border-radius:6px;}
+  .tab-del:hover{color:#fff;background:var(--attack);}
 </style>
 </head>
 <body>
@@ -276,7 +279,9 @@ const DEFAULT_META = {
     lifecycle: ["KSA","Malaysia","India","Poland","Belgium","UAE","France","Germany","Oman","Philippines","Global e-Invoicing","UK","Qatar","Spain","Netherlands","Ireland","US","Singapore","Australia"],
     multicountry: ["KSA to UAE","Malaysia to Philippines","EU to France","EU to Germany"]
   },
-  passcode: null
+  passcode: null,
+  hiddenStages: [],
+  removedCountries: {}
 };
 
 
@@ -430,6 +435,34 @@ const FIELD_SETS = {
     {key:'bannerLink', label:'Banner / Creative Link', type:'text'},
     {key:'version', label:'Version', type:'text'},
     {key:'notes', label:'Notes', type:'textarea'}
+  ],
+  // Only stats owned by the performance report itself - never a field also
+  // present in calendar_webinar (topic/market/date/time/speaker/deckLink/
+  // notes/etc.), since the library view merges calendar + performance
+  // records with performance winning on overlap; duplicating a key here
+  // would let a blank save silently blank out the calendar's real value.
+  performance_webinar: [
+    {key:'registrations', label:'Registrations', type:'number'},
+    {key:'attended', label:'Attended', type:'number'},
+    {key:'leadsCount', label:'Leads', type:'number'},
+    {key:'mqlCount', label:'MQL', type:'number'},
+    {key:'salCount', label:'SAL', type:'number'},
+    {key:'turnoutRate', label:'Turnout Rate', type:'text'},
+    {key:'avgWatchTime', label:'Avg Watch Time', type:'text'},
+    {key:'focusScore', label:'Focus Score', type:'text'},
+    {key:'hotLeadConversion', label:'HOT Lead Conversion', type:'text'},
+    {key:'regBreakdown', label:'Registered by market', type:'textarea'},
+    {key:'attendedBreakdown', label:'Attended by market', type:'textarea'},
+    {key:'sourceBreakdown', label:'Registration source', type:'textarea'},
+    {key:'keyAccounts', label:'Key accounts in the room', type:'textarea'},
+    {key:'liveQuestions', label:'Live questions', type:'textarea'},
+    {key:'radDemoClicks', label:'RAD demo clicks', type:'text'},
+    {key:'assetDownloads', label:'Asset downloads', type:'text'},
+    {key:'keyInsights', label:'Key insights (one per line)', type:'textarea'},
+    {key:'recordingLink', label:'Recording link', type:'text'},
+    {key:'registrationLink', label:'Registration page link', type:'text'},
+    {key:'bannerFolderLink', label:'Banner creatives folder link', type:'text'},
+    {key:'linkedinPosts', label:'LinkedIn posts shared (count)', type:'number'}
   ]
 };
 const SECTION_LABEL = {base:"Email Base", performance:"Performance Tracker", calendar:"Calendar", copies:"Copies", insights:"Insights", execution:"Execution Tracker"};
@@ -448,6 +481,8 @@ let qdataCache = {};
 let commentsCache = {};
 let editMode = false;
 let commenterName = "";
+let currentWebinarPerfEntry = null;
+let currentWebinarExecEntry = null;
 
 let state = {quarter:null, channel:null, section:null, group:null, country:null, search:"", modal:null, openComments:{}, sortField:null, sortDir:'asc', weekFilter:'all', webinarRegion:'all', webinarPerfTab:'past', webinarPerfId:null, webinarPerfRegion:'all', leadsExpanded:false, leadsTagFilter:'all', leadsDesignationFilter:'all', webinarExecId:null, webinarExecTab:'upcoming', webinarExecRegion:'all', webinarCopiesRegion:'all', webinarCopyId:null, welcomed:false};
 
@@ -468,21 +503,30 @@ function mergeMetaWithDefaults(loaded){
   const allDefaultCountries = new Set();
   for(const list of Object.values(DEFAULT_META.stageGroups)) for(const c of list) allDefaultCountries.add(c);
 
+  // Countries an editor has explicitly deleted via the UI. Without this, a
+  // deleted DEFAULT country would silently reappear on the next load, since
+  // the loop below always starts from DEFAULT_META's full list.
+  const removedCountries = (merged.removedCountries && typeof merged.removedCountries === 'object') ? merged.removedCountries : {};
+
   merged.stageGroups = {};
   for(const g of Object.keys(DEFAULT_META.stageGroups)){
-    const base = [...DEFAULT_META.stageGroups[g]];
+    const removedHere = new Set(Array.isArray(removedCountries[g]) ? removedCountries[g] : []);
+    const base = DEFAULT_META.stageGroups[g].filter(c=>!removedHere.has(c));
     const old = Array.isArray(oldGroups[g]) ? oldGroups[g] : [];
     // Keep only genuinely custom countries the person added themselves - ones
     // that don't belong to any recognized default group anywhere else, and
     // aren't on the deprecated list.
     for(const c of old){
       if(DEPRECATED_COUNTRIES.has(c)) continue;
+      if(removedHere.has(c)) continue;
       if(!allDefaultCountries.has(c) && !base.includes(c)) base.push(c);
     }
     merged.stageGroups[g] = base;
   }
+  merged.removedCountries = removedCountries;
 
   if(typeof merged.passcode === 'undefined') merged.passcode = null;
+  if(!Array.isArray(merged.hiddenStages)) merged.hiddenStages = [];
   return merged;
 }
 
@@ -1317,7 +1361,7 @@ async function renderWebinarPerformanceView(){
 
   if(state.webinarPerfId){
     const entry = merged.find(e => e.id===state.webinarPerfId);
-    if(entry) return renderWebinarPerfDetail(entry);
+    if(entry){ currentWebinarPerfEntry = entry; return renderWebinarPerfDetail(entry); }
   }
 
   const todayStr = ymd(new Date());
@@ -1438,7 +1482,8 @@ function renderWebinarLeadsSection(e){
 
 function renderWebinarPerfDetail(e){
   const region = webinarRegion(e.market);
-  const backBtn = `<button class="btn ghost small" data-action="webinar-perf-back" style="margin-bottom:14px;">← Back to library</button>`;
+  const backBtn = `<button class="btn ghost small" data-action="webinar-perf-back" style="margin-bottom:14px;">← Back to library</button>
+  ${editMode ? `<button class="btn small" data-action="webinar-perf-edit" style="margin-bottom:14px;margin-left:8px;">✏️ ${e.perfId?'Edit':'Add'} report</button>` : ''}`;
 
   const insightLines = (e.keyInsights||'').split('\n').filter(Boolean);
 
@@ -1588,7 +1633,7 @@ async function renderWebinarExecutionView(){
 
   if(state.webinarExecId){
     const entry = merged.find(e => e.id===state.webinarExecId);
-    if(entry) return renderWebinarExecutionDetail(entry);
+    if(entry){ currentWebinarExecEntry = entry; return renderWebinarExecutionDetail(entry); }
   }
 
   const todayStr = ymd(new Date());
@@ -1647,9 +1692,12 @@ async function renderWebinarExecutionView(){
   ${cardsHtml}`;
 }
 
+const EXEC_STATUS_OPTIONS = ['Not started','In Progress','Done','Blocked'];
+
 function renderWebinarExecutionDetail(e){
   const region = webinarRegion(e.market);
-  const backBtn = `<button class="btn ghost small" data-action="webinar-exec-back" style="margin-bottom:14px;">← Back to library</button>`;
+  const backBtn = `<button class="btn ghost small" data-action="webinar-exec-back" style="margin-bottom:14px;">← Back to library</button>
+  ${editMode ? `<button class="btn small" data-action="webinar-exec-edit" style="margin-bottom:14px;margin-left:8px;">✏️ Edit checklist</button>` : ''}`;
 
   const stepRows = EXECUTION_STEPS.map(s=>{
     const owner = execStepVal(e, s.key, 'owner', s.defaultOwner);
@@ -1838,9 +1886,14 @@ function renderWebinarCards(shown, comments){
 }
 
 function stageGroupTabs(){
-  return `<div class="tabs stagegroup-tabs">${Object.keys(STAGE_META).map(g=>
-    `<button class="tab ${state.group===g?'active':''}" data-nav="group" data-g="${g}"><span class="dot"></span>${STAGE_META[g].label}</button>`
-  ).join('')}</div>`;
+  const hidden = (meta.hiddenStages||[]).filter(g=>STAGE_META[g]);
+  const visible = Object.keys(STAGE_META).filter(g=>!hidden.includes(g));
+  const restoreRow = (editMode && hidden.length) ? `<div class="tabs stagegroup-tabs" style="border-bottom:none;padding-bottom:0;margin-bottom:10px;">
+      ${hidden.map(g=>`<button class="btn ghost small" data-action="restore-stage" data-g="${g}" title="Restore this stage">↺ ${esc(STAGE_META[g].label)}</button>`).join('')}
+    </div>` : '';
+  return `<div class="tabs stagegroup-tabs">${visible.map(g=>
+    `<span class="tab-item"><button class="tab ${state.group===g?'active':''}" data-nav="group" data-g="${g}"><span class="dot"></span>${STAGE_META[g].label}</button>${editMode?`<button class="tab-del" data-action="del-stage" data-g="${g}" title="Remove this stage tab">🗑️</button>`:''}</span>`
+  ).join('')}</div>${restoreRow}`;
 }
 
 function countryTabs(){
@@ -1850,7 +1903,7 @@ function countryTabs(){
       <button class="btn small" data-action="add-country">Add</button>
     </span>` : '';
   return `<div class="tabs country-tabs">${countries.map(c=>
-    `<button class="tab ${state.country===c?'active':''}" data-nav="country" data-cn="${esc(c)}">${esc(c)}</button>`
+    `<span class="tab-item"><button class="tab ${state.country===c?'active':''}" data-nav="country" data-cn="${esc(c)}">${esc(c)}</button>${editMode?`<button class="tab-del" data-action="del-country" data-cn="${esc(c)}" title="Delete this country">🗑️</button>`:''}</span>`
   ).join('')}${addForm}</div>`;
 }
 
@@ -2408,6 +2461,79 @@ function entryModal(entry){
   </div>`;
 }
 
+function webinarPerfModal(entry){
+  const fields = FIELD_SETS.performance_webinar;
+  const fieldsHtml = fields.map(f=>{
+    const val = esc(entry[f.key]);
+    if(f.type==='textarea') return `<div class="field"><label>${f.label}</label><textarea data-pf="${f.key}">${val}</textarea></div>`;
+    return `<div class="field"><label>${f.label}</label><input type="${f.type}" data-pf="${f.key}" value="${val}"></div>`;
+  }).join('');
+  return `<div class="modal-bg" data-action="webinar-perf-modal-bg">
+    <div class="modal" data-stop>
+      <h3>${entry.perfId?'Edit':'Add'} performance report — ${esc(entry.topic||'Untitled')}</h3>
+      ${fieldsHtml}
+      <div class="modal-actions">
+        <button class="btn ghost" data-action="webinar-perf-modal-cancel">Cancel</button>
+        <button class="btn" data-action="webinar-perf-modal-save">Save</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function execStatusSelect(name, current){
+  return `<select data-ef="${name}">${EXEC_STATUS_OPTIONS.map(o=>
+    `<option ${(current||'Not started')===o?'selected':''}>${o}</option>`
+  ).join('')}</select>`;
+}
+
+function webinarExecModal(entry){
+  const stepsHtml = EXECUTION_STEPS.map(s=>`
+    <div class="drip-card" style="margin-bottom:10px;padding:12px 14px;">
+      <div style="font-weight:600;font-size:12.5px;margin-bottom:8px;">${s.label}</div>
+      <div style="display:grid;grid-template-columns:1fr 140px;gap:8px;">
+        <div class="field" style="margin:0;"><label>Owner</label><input type="text" data-ef="step.${s.key}.owner" value="${esc(execStepVal(entry,s.key,'owner',s.defaultOwner))}"></div>
+        <div class="field" style="margin:0;"><label>Status</label>${execStatusSelect('step.'+s.key+'.status', execStepVal(entry,s.key,'status'))}</div>
+      </div>
+      <div class="field" style="margin:8px 0 0;"><label>Notes</label><input type="text" data-ef="step.${s.key}.notes" value="${esc(execStepVal(entry,s.key,'notes'))}"></div>
+    </div>`).join('');
+
+  const distHtml = EXECUTION_DIST_CHANNELS.map(c=>`
+    <div class="drip-card" style="margin-bottom:10px;padding:12px 14px;">
+      <div style="font-weight:600;font-size:12.5px;margin-bottom:8px;">${c.label}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 140px;gap:8px;">
+        <div class="field" style="margin:0;"><label>Target</label><input type="text" data-ef="dist.${c.key}.target" value="${esc(execDistVal(entry,c.key,'target'))}"></div>
+        <div class="field" style="margin:0;"><label>Current</label><input type="text" data-ef="dist.${c.key}.current" value="${esc(execDistVal(entry,c.key,'current'))}"></div>
+        <div class="field" style="margin:0;"><label>Status</label>${execStatusSelect('dist.'+c.key+'.status', execDistVal(entry,c.key,'status'))}</div>
+      </div>
+      <div class="field" style="margin:8px 0 0;"><label>Notes</label><input type="text" data-ef="dist.${c.key}.notes" value="${esc(execDistVal(entry,c.key,'notes'))}"></div>
+    </div>`).join('');
+
+  const linksHtml = EXECUTION_LINKS.map(l=>`
+    <div class="drip-card" style="margin-bottom:10px;padding:12px 14px;">
+      <div style="font-weight:600;font-size:12.5px;margin-bottom:8px;">${l.label}</div>
+      <div style="display:grid;grid-template-columns:1fr 140px;gap:8px;">
+        <div class="field" style="margin:0;"><label>URL</label><input type="text" data-ef="link.${l.key}.link" value="${esc(execLinkVal(entry,l.key,'link'))}"></div>
+        <div class="field" style="margin:0;"><label>Status</label>${execStatusSelect('link.'+l.key+'.status', execLinkVal(entry,l.key,'status'))}</div>
+      </div>
+    </div>`).join('');
+
+  return `<div class="modal-bg" data-action="webinar-exec-modal-bg">
+    <div class="modal" data-stop style="max-width:640px;">
+      <h3>Edit execution checklist — ${esc(entry.topic||'Untitled')}</h3>
+      <div class="drip-card-title" style="margin-bottom:8px;">Checklist</div>
+      ${stepsHtml}
+      <div class="drip-card-title" style="margin:16px 0 8px;">Channel distribution</div>
+      ${distHtml}
+      <div class="drip-card-title" style="margin:16px 0 8px;">Links created</div>
+      ${linksHtml}
+      <div class="modal-actions">
+        <button class="btn ghost" data-action="webinar-exec-modal-cancel">Cancel</button>
+        <button class="btn" data-action="webinar-exec-modal-save">Save</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 async function render(){
   const app = document.getElementById('app');
   let html;
@@ -2425,6 +2551,12 @@ async function render(){
 
   if(state.modal){
     html += entryModal(state.modal.entry);
+  }
+  if(state.webinarPerfModal){
+    html += webinarPerfModal(state.webinarPerfModal);
+  }
+  if(state.webinarExecModal){
+    html += webinarExecModal(state.webinarExecModal);
   }
   app.innerHTML = html;
   document.getElementById('sidebar').innerHTML = renderSidebar();
@@ -2510,9 +2642,51 @@ function bindEvents(){
     if(!val) return;
     if(!meta.stageGroups[state.group].includes(val)){
       meta.stageGroups[state.group].push(val);
-      await saveMeta();
     }
+    if(meta.removedCountries && meta.removedCountries[state.group]){
+      meta.removedCountries[state.group] = meta.removedCountries[state.group].filter(c=>c!==val);
+    }
+    await saveMeta();
     render();
+  });
+
+  app.querySelectorAll('[data-action="del-country"]').forEach(b=>{
+    b.addEventListener('click', async (ev)=>{
+      ev.stopPropagation();
+      const cn = b.dataset.cn;
+      const ok = await customConfirm(`Delete country "${cn}" from this stage?\n\nIts existing entries stay saved in the background — re-add the country here to see them again.`);
+      if(!ok) return;
+      meta.stageGroups[state.group] = (meta.stageGroups[state.group]||[]).filter(c=>c!==cn);
+      if(!meta.removedCountries) meta.removedCountries = {};
+      if(!meta.removedCountries[state.group]) meta.removedCountries[state.group] = [];
+      if(!meta.removedCountries[state.group].includes(cn)) meta.removedCountries[state.group].push(cn);
+      if(state.country===cn) state.country = null;
+      await saveMeta();
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="del-stage"]').forEach(b=>{
+    b.addEventListener('click', async (ev)=>{
+      ev.stopPropagation();
+      const g = b.dataset.g;
+      const label = STAGE_META[g] ? STAGE_META[g].label : g;
+      const ok = await customConfirm(`Remove the "${label}" stage tab?\n\nIts existing entries stay saved in the background — restore it anytime with the ↺ button.`);
+      if(!ok) return;
+      if(!Array.isArray(meta.hiddenStages)) meta.hiddenStages = [];
+      if(!meta.hiddenStages.includes(g)) meta.hiddenStages.push(g);
+      if(state.group===g){ state.group=null; state.country=null; }
+      await saveMeta();
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="restore-stage"]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      meta.hiddenStages = (meta.hiddenStages||[]).filter(g=>g!==b.dataset.g);
+      await saveMeta();
+      render();
+    });
   });
 
   const searchInput = app.querySelector('[data-role="search"]');
@@ -2618,6 +2792,84 @@ function bindEvents(){
     }
     await saveQData(state.quarter);
     state.modal = null;
+    render();
+  });
+
+  const webinarPerfEditBtn = app.querySelector('[data-action="webinar-perf-edit"]');
+  if(webinarPerfEditBtn) webinarPerfEditBtn.addEventListener('click', ()=>{
+    if(currentWebinarPerfEntry) state.webinarPerfModal = currentWebinarPerfEntry;
+    render();
+  });
+
+  const webinarPerfModalBg = app.querySelector('[data-action="webinar-perf-modal-bg"]');
+  if(webinarPerfModalBg) webinarPerfModalBg.addEventListener('click', (ev)=>{ if(ev.target===webinarPerfModalBg){ state.webinarPerfModal=null; render(); } });
+
+  const webinarPerfModalCancel = app.querySelector('[data-action="webinar-perf-modal-cancel"]');
+  if(webinarPerfModalCancel) webinarPerfModalCancel.addEventListener('click', ()=>{ state.webinarPerfModal=null; render(); });
+
+  const webinarPerfModalSave = app.querySelector('[data-action="webinar-perf-modal-save"]');
+  if(webinarPerfModalSave) webinarPerfModalSave.addEventListener('click', async ()=>{
+    const entry = state.webinarPerfModal;
+    const fields = FIELD_SETS.performance_webinar;
+    const vals = {};
+    fields.forEach(f=>{ vals[f.key] = app.querySelector(`[data-pf="${f.key}"]`).value; });
+    const data = await loadQData(state.quarter);
+    if(entry.perfId){
+      const idx = data.entries.findIndex(x=>x.id===entry.perfId);
+      data.entries[idx] = {...data.entries[idx], ...vals, updatedAt:Date.now()};
+    } else {
+      // A fresh performance record gets its own id, distinct from the
+      // calendar-only placeholder's id the library was showing - repoint
+      // webinarPerfId at it so the detail view stays open after saving
+      // instead of falling through to the library (id no longer matches).
+      const newId = uid();
+      data.entries.push({id:newId, channel:'webinar', kind:'performance', market:entry.market, topic:entry.topic, date:entry.date, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
+      state.webinarPerfId = newId;
+    }
+    await saveQData(state.quarter);
+    state.webinarPerfModal = null;
+    render();
+  });
+
+  const webinarExecEditBtn = app.querySelector('[data-action="webinar-exec-edit"]');
+  if(webinarExecEditBtn) webinarExecEditBtn.addEventListener('click', ()=>{
+    if(currentWebinarExecEntry) state.webinarExecModal = currentWebinarExecEntry;
+    render();
+  });
+
+  const webinarExecModalBg = app.querySelector('[data-action="webinar-exec-modal-bg"]');
+  if(webinarExecModalBg) webinarExecModalBg.addEventListener('click', (ev)=>{ if(ev.target===webinarExecModalBg){ state.webinarExecModal=null; render(); } });
+
+  const webinarExecModalCancel = app.querySelector('[data-action="webinar-exec-modal-cancel"]');
+  if(webinarExecModalCancel) webinarExecModalCancel.addEventListener('click', ()=>{ state.webinarExecModal=null; render(); });
+
+  const webinarExecModalSave = app.querySelector('[data-action="webinar-exec-modal-save"]');
+  if(webinarExecModalSave) webinarExecModalSave.addEventListener('click', async ()=>{
+    const entry = state.webinarExecModal;
+    const data = await loadQData(state.quarter);
+    const existingIdx = entry.execId ? data.entries.findIndex(x=>x.id===entry.execId) : -1;
+    const existing = existingIdx>=0 ? data.entries[existingIdx] : {};
+    const execSteps = JSON.parse(JSON.stringify(existing.execSteps||{}));
+    const execDistribution = JSON.parse(JSON.stringify(existing.execDistribution||{}));
+    const execLinks = JSON.parse(JSON.stringify(existing.execLinks||{}));
+    app.querySelectorAll('[data-ef]').forEach(inp=>{
+      const [group, key, field] = inp.dataset.ef.split('.');
+      const bag = group==='step' ? execSteps : group==='dist' ? execDistribution : execLinks;
+      bag[key] = bag[key] || {};
+      bag[key][field] = inp.value;
+    });
+    if(existingIdx>=0){
+      data.entries[existingIdx] = {...existing, execSteps, execDistribution, execLinks, updatedAt:Date.now()};
+    } else {
+      // Same id-repointing as the performance modal - a fresh execution
+      // record gets a new id, so keep webinarExecId in sync or the detail
+      // view falls through to the library right after saving.
+      const newId = uid();
+      data.entries.push({id:newId, channel:'webinar', kind:'execution', market:entry.market, topic:entry.topic, date:entry.date, execSteps, execDistribution, execLinks, updatedAt:Date.now(), createdAt:Date.now()});
+      state.webinarExecId = newId;
+    }
+    await saveQData(state.quarter);
+    state.webinarExecModal = null;
     render();
   });
 }

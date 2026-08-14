@@ -3,6 +3,7 @@ import prisma from '../config/database';
 import { env } from '../config/env';
 import { syncInstantlyToQuarter } from '../services/instantlySync.service';
 import { syncHubSpotToQuarter } from '../services/hubspotSync.service';
+import { syncLinkedInToQuarter } from '../services/linkedinSync.service';
 
 async function activeQuarters(): Promise<string[]> {
   const row = await prisma.kVStore.findUnique({ where: { key: 'meta' } });
@@ -40,6 +41,7 @@ export const runDailySync = async (req: Request, res: Response): Promise<void> =
     const perQ: any = { quarter: q };
     try { perQ.instantly = await syncInstantlyToQuarter(q); } catch (e: any) { perQ.instantly = { error: e.message?.slice(0, 140) }; }
     try { perQ.hubspot = await syncHubSpotToQuarter(q); } catch (e: any) { perQ.hubspot = { error: e.message?.slice(0, 140) }; }
+    try { perQ.linkedin = await syncLinkedInToQuarter(q); } catch (e: any) { perQ.linkedin = { error: e.message?.slice(0, 140) }; }
     results.push(perQ);
   }
 

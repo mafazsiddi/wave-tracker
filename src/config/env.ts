@@ -20,6 +20,13 @@ const envSchema = z.object({
   // to the browser — so it can't be read from view-source / inspect element.
   // Editors (Shweta & Gourav) type it; the frontend verifies via /api/access/verify.
   EDIT_PIN: z.string().optional().default('wave2026'),
+
+  // LinkedIn Developer App (Community Management API) — 3-legged OAuth.
+  // Client ID/Secret from the app's Auth tab. Redirect URI must exactly match
+  // one registered there (Auth tab -> OAuth 2.0 settings -> Redirect URLs).
+  LINKEDIN_CLIENT_ID: z.string().optional().default(''),
+  LINKEDIN_CLIENT_SECRET: z.string().optional().default(''),
+  LINKEDIN_REDIRECT_URI: z.string().optional().default('http://localhost:5000/api/linkedin/callback'),
 });
 
 export const env = envSchema.parse(process.env);
