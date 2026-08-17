@@ -1342,6 +1342,22 @@ function webinarBannerHtml(entry, sizeClass, keyOverride){
   </div>`;
 }
 
+// Play-button overlay shown on top of the banner/placeholder whenever a
+// recording link exists, so a webinar with a video is visually distinct in
+// the library grid, not just on its own detail page. data-action (rather than
+// inline onclick, to match the rest of the app) + stopPropagation in
+// bindEvents keeps a click from also triggering the card's own data-nav.
+function recordingPlayOverlay(link, size){
+  if(!link) return '';
+  const d = size || 64;
+  const arrow = Math.round(d*0.33);
+  return `<a href="${esc(link)}" target="_blank" rel="noopener" title="Watch the recording" data-action="watch-recording" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-decoration:none;">
+    <div style="width:${d}px;height:${d}px;border-radius:50%;background:rgba(15,42,40,.55);display:flex;align-items:center;justify-content:center;">
+      <div style="width:0;height:0;border-top:${arrow}px solid transparent;border-bottom:${arrow}px solid transparent;border-left:${Math.round(arrow*1.6)}px solid #fff;margin-left:${Math.round(d*0.06)}px;"></div>
+    </div>
+  </a>`;
+}
+
 // Execution Tracker cards use a region badge instead of a creative - a round
 // map/globe emblem labeled with the region (GCC/EU/India/SEA/Global), since
 // there's no banner to show yet at the planning stage.
@@ -1415,7 +1431,10 @@ async function renderWebinarPerformanceView(){
   const cardsHtml = shown.length ? `<div class="grid">${shown.map(e=>{
     const region = webinarRegion(e.market);
     return `<div class="card" style="padding:0;overflow:hidden;" data-nav="webinar-detail" data-id="${e.id}">
-      ${webinarBannerHtml(e)}
+      <div style="position:relative;">
+        ${webinarBannerHtml(e)}
+        ${recordingPlayOverlay(e.recordingLink, 48)}
+      </div>
       <div style="padding:14px 16px;">
         <h3 style="font-size:14.5px;margin:0 0 6px;">${esc(e.topic||'Untitled')}</h3>
         <div class="meta">📅 ${esc(formatDateDisplay(e.date)||'Date TBD')}${e.time? ' · '+esc(e.time):''}</div>
@@ -1523,11 +1542,7 @@ function renderWebinarPerfDetail(e){
   <div class="drip-card" style="overflow:hidden;">
     <div style="position:relative;">
       ${webinarBannerHtml(e, 'aspect-ratio:16/9;', e.bannerImageWideKey || e.bannerImageKey)}
-      ${e.recordingLink ? `<a href="${e.recordingLink}" target="_blank" title="Watch the recording" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-decoration:none;">
-        <div style="width:64px;height:64px;border-radius:50%;background:rgba(15,42,40,.55);display:flex;align-items:center;justify-content:center;transition:background .15s;">
-          <div style="width:0;height:0;border-top:13px solid transparent;border-bottom:13px solid transparent;border-left:21px solid #fff;margin-left:4px;"></div>
-        </div>
-      </a>` : ''}
+      ${recordingPlayOverlay(e.recordingLink, 64)}
     </div>
     <div style="padding:20px;">
       <h2 style="margin:0 0 4px;font-size:20px;">${esc(e.topic||'Untitled')}</h2>
@@ -1956,6 +1971,13 @@ async function renderCountryPicker(){
 }
 
 function fieldKey(){ return state.section+'_'+state.channel; }
+
+// Entries added via "+ Add webinar" from Performance/Execution are really
+// Calendar-kind entries (that's what the perf/exec merge matches against),
+// but we want the page underneath the modal to stay on Performance/Execution
+// instead of visibly switching to Calendar. state.modal.kindOverride carries
+// that "save as calendar" intent without touching state.section.
+function activeFieldKey(){ return ((state.modal && state.modal.kindOverride) || state.section)+'_'+state.channel; }
 
 function filterEntries(entries){
   if(!state.search) return entries;
@@ -2472,7 +2494,7 @@ function renderDripGroups(shown, comments, fields){
 }
 
 function entryModal(entry){
-  const fields = FIELD_SETS[fieldKey()];
+  const fields = FIELD_SETS[activeFieldKey()];
   const isEdit = !!entry;
   const fieldsHtml = fields.map(f=>{
     const val = entry ? esc(entry[f.key]) : '';
@@ -2652,6 +2674,10 @@ function bindEvents(){
       else if(type==='webinar-copy-detail'){ state.webinarCopyId=elx.dataset.id; }
       render();
     });
+  });
+
+  app.querySelectorAll('[data-action="watch-recording"]').forEach(a=>{
+    a.addEventListener('click', ev=>ev.stopPropagation());
   });
 
   const webinarPerfBackBtn = app.querySelector('[data-action="webinar-perf-back"]');
@@ -2860,7 +2886,8 @@ function bindEvents(){
 
   const saveBtn = app.querySelector('[data-action="modal-save"]');
   if(saveBtn) saveBtn.addEventListener('click', async ()=>{
-    const fields = FIELD_SETS[fieldKey()];
+    const kind = (state.modal && state.modal.kindOverride) || state.section;
+    const fields = FIELD_SETS[activeFieldKey()];
     const vals = {};
     fields.forEach(f=>{
       const inp = app.querySelector(`[data-f="${f.key}"]`);
@@ -2872,7 +2899,7 @@ function bindEvents(){
       const idx = data.entries.findIndex(e=>e.id===id);
       data.entries[idx] = {...data.entries[idx], ...vals, updatedAt:Date.now()};
     } else {
-      data.entries.push({id:uid(), channel:state.channel, kind:state.section, group:state.group, country:state.country, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
+      data.entries.push({id:uid(), channel:state.channel, kind, group:state.group, country:state.country, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
     }
     await saveQData(state.quarter);
     state.modal = null;
@@ -2960,10 +2987,10 @@ function bindEvents(){
   const addWebinarEntryBtn = app.querySelector('[data-action="add-webinar-entry"]');
   if(addWebinarEntryBtn) addWebinarEntryBtn.addEventListener('click', ()=>{
     // Reuse the Calendar section's generic add-entry modal (FIELD_SETS.calendar_webinar)
-    // so a brand-new webinar can be logged directly from Performance/Execution too,
-    // instead of requiring a detour through the Calendar tab first.
-    state.section = 'calendar';
-    state.modal = {entry:null};
+    // so a brand-new webinar can be logged directly from Performance/Execution, without
+    // ever switching state.section — kindOverride tells the modal/save handler to treat
+    // this as a calendar-kind entry while the page underneath stays on Performance/Execution.
+    state.modal = {entry:null, kindOverride:'calendar'};
     render();
   });
 
