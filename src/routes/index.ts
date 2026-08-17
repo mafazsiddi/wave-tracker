@@ -6,6 +6,7 @@ import hubspotRoutes from './hubspot.routes';
 import instantlyRoutes from './instantly.routes';
 import linkedinRoutes from './linkedin.routes';
 import cronRoutes from './cron.routes';
+import linkPreviewRoutes from './linkPreview.routes';
 
 const router = Router();
 
@@ -18,5 +19,6 @@ router.use('/hubspot', hubspotRoutes);
 router.use('/instantly', instantlyRoutes);
 router.use('/linkedin', linkedinRoutes);
 router.use('/cron', cronRoutes);
+router.use('/link-preview', linkPreviewRoutes);
 
 export default router;

@@ -486,6 +486,10 @@ let editMode = false;
 let commenterName = "";
 let currentWebinarPerfEntry = null;
 let currentWebinarExecEntry = null;
+// Keyed by merged-entry id so a library-grid card's edit button can open the
+// report modal directly, without navigating into the detail view first.
+let webinarPerfMergedById = new Map();
+let webinarExecMergedById = new Map();
 
 let state = {quarter:null, channel:null, section:null, group:null, country:null, search:"", modal:null, openComments:{}, sortField:null, sortDir:'asc', weekFilter:'all', webinarRegion:'all', webinarPerfTab:'past', webinarPerfId:null, webinarPerfRegion:'all', leadsExpanded:false, leadsTagFilter:'all', leadsDesignationFilter:'all', webinarExecId:null, webinarExecTab:'upcoming', webinarExecRegion:'all', webinarCopiesRegion:'all', webinarCopyId:null, welcomed:false};
 
@@ -1329,17 +1333,61 @@ async function renderWebinarView(){
   ${bodyHtml}`;
 }
 
+// YouTube exposes a thumbnail for any video at a predictable URL keyed only
+// by video ID - no API call/auth needed, so this can stay a sync regex match
+// instead of an async fetch. Covers watch?v=, youtu.be/, embed/, shorts/.
+function youtubeThumbFromLink(link){
+  if(!link) return null;
+  const m = String(link).match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? `https://img.youtube.com/vi/${m[1]}/hqdefault.jpg` : null;
+}
+
+// Google Drive exposes a thumbnail for any file (including a generated video
+// frame) at a predictable URL keyed only by file ID, same idea as YouTube's -
+// no backend fetch needed. Only renders if the file is shared "Anyone with
+// the link"; otherwise the endpoint serves a generic broken-image response.
+function driveThumbFromLink(link){
+  if(!link) return null;
+  const m = String(link).match(/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]+)/) || String(link).match(/[?&]id=([A-Za-z0-9_-]+)/);
+  return m ? `https://drive.google.com/thumbnail?id=${m[1]}&sz=w1000` : null;
+}
+
+// Marks the banner wrapper for lazy hydration (see hydrateLinkPreviews) when
+// there's a recording link but no synchronous thumbnail available yet - the
+// wrapper carries enough info (link + sizing) for the hydration pass to fetch
+// and swap in a real image without a full re-render.
+function bannerLpAttrs(entry, sizeClass){
+  if(!entry.recordingLink) return '';
+  return ` data-recording-link="${esc(entry.recordingLink)}" data-lp-size="${esc(sizeClass||'aspect-ratio:1/1;')}" data-lp-topic="${esc(entry.topic||'Webinar')}"`;
+}
+
+// Plain placeholder - a real creative gets uploaded per webinar before this
+// matters for Performance; no need for elaborate artwork here. Also used as
+// the runtime fallback (see bindEvents' img error handler below) when a
+// resolved thumbnail URL turns out to not actually be loadable - e.g. a
+// Drive/YouTube ID that construct a valid-looking URL but 404s or, for
+// Drive, redirects to a login page because the file isn't public.
+function bannerPlaceholderHtml(topic, sizeClass){
+  return `<div style="width:100%;${sizeClass||'aspect-ratio:1/1;'}border-radius:12px 12px 0 0;background:linear-gradient(135deg,var(--accent),var(--accent-dark));display:flex;align-items:center;justify-content:center;padding:16px;">
+    <div style="color:#fff;font-weight:700;font-size:14px;text-align:center;line-height:1.4;">${esc(topic||'Webinar')}</div>
+  </div>`;
+}
+
 function webinarBannerHtml(entry, sizeClass, keyOverride){
   const key = keyOverride || entry.bannerImageKey;
-  const img = key && WEBINAR_BANNERS[key];
+  const staticImg = key && WEBINAR_BANNERS[key];
+  const externalImg = !staticImg && (youtubeThumbFromLink(entry.recordingLink) || driveThumbFromLink(entry.recordingLink));
+  const img = staticImg || externalImg;
   if(img){
-    return `<img src="${img}" alt="" style="width:100%;${sizeClass||'aspect-ratio:1/1;'}object-fit:cover;border-radius:12px 12px 0 0;display:block;">`;
+    // externalImg (YouTube/Drive) can fail to actually load (private Drive
+    // file, deleted video, etc.) even though the URL looks valid - the
+    // fallback attrs let bindEvents swap in the placeholder instead of
+    // leaving a broken-image icon. staticImg is bundled with the app, so it
+    // doesn't need this.
+    const fallbackAttrs = externalImg ? ` data-img-fallback-topic="${esc(entry.topic||'Webinar')}" data-img-fallback-size="${esc(sizeClass||'aspect-ratio:1/1;')}"` : '';
+    return `<img src="${img}" alt=""${fallbackAttrs} style="width:100%;${sizeClass||'aspect-ratio:1/1;'}object-fit:cover;border-radius:12px 12px 0 0;display:block;">`;
   }
-  // Plain placeholder - a real creative gets uploaded per webinar before this
-  // matters for Performance; no need for elaborate artwork here.
-  return `<div style="width:100%;${sizeClass||'aspect-ratio:1/1;'}border-radius:12px 12px 0 0;background:linear-gradient(135deg,var(--accent),var(--accent-dark));display:flex;align-items:center;justify-content:center;padding:16px;">
-    <div style="color:#fff;font-weight:700;font-size:14px;text-align:center;line-height:1.4;">${esc(entry.topic||'Webinar')}</div>
-  </div>`;
+  return bannerPlaceholderHtml(entry.topic, sizeClass);
 }
 
 // Play-button overlay shown on top of the banner/placeholder whenever a
@@ -1356,6 +1404,15 @@ function recordingPlayOverlay(link, size){
       <div style="width:0;height:0;border-top:${arrow}px solid transparent;border-bottom:${arrow}px solid transparent;border-left:${Math.round(arrow*1.6)}px solid #fff;margin-left:${Math.round(d*0.06)}px;"></div>
     </div>
   </a>`;
+}
+
+// Small pencil button on the corner of a library card so a report can be
+// added/edited straight from the grid, without opening the detail view
+// first. Only shown in edit mode; stopPropagation (bound in bindEvents)
+// keeps the click from also triggering the card's own data-nav.
+function cardEditButton(action, id, label){
+  if(!editMode) return '';
+  return `<button class="btn small" data-action="${action}" data-id="${id}" title="${esc(label)}" style="position:absolute;top:8px;right:8px;width:30px;height:30px;padding:0;border-radius:50%;line-height:1;">✏️</button>`;
 }
 
 // Execution Tracker cards use a region badge instead of a creative - a round
@@ -1410,6 +1467,7 @@ async function renderWebinarPerformanceView(){
     const key = webinarLibraryKey(p);
     if(!seenKeys.has(key)) merged.push(p);
   }
+  webinarPerfMergedById = new Map(merged.map(e=>[e.id, e]));
 
   if(state.webinarPerfId){
     const entry = merged.find(e => e.id===state.webinarPerfId);
@@ -1431,9 +1489,9 @@ async function renderWebinarPerformanceView(){
   const cardsHtml = shown.length ? `<div class="grid">${shown.map(e=>{
     const region = webinarRegion(e.market);
     return `<div class="card" style="padding:0;overflow:hidden;" data-nav="webinar-detail" data-id="${e.id}">
-      <div style="position:relative;">
+      <div style="position:relative;"${bannerLpAttrs(e)}>
         ${webinarBannerHtml(e)}
-        ${recordingPlayOverlay(e.recordingLink, 48)}
+        ${cardEditButton('webinar-perf-card-edit', e.id, e.perfId?'Edit report':'Add report')}
       </div>
       <div style="padding:14px 16px;">
         <h3 style="font-size:14.5px;margin:0 0 6px;">${esc(e.topic||'Untitled')}</h3>
@@ -1457,7 +1515,6 @@ async function renderWebinarPerformanceView(){
   ${regionTabsHtml('webinar-perf-region', state.webinarPerfRegion, regionCounts, list.length)}
   <div class="toolbar">
     <input class="search" placeholder="Filter…" value="${esc(state.search)}" data-role="search">
-    ${editMode? `<button class="btn" data-action="add-webinar-entry">+ Add webinar</button>`:''}
   </div>
   ${cardsHtml}`;
 }
@@ -1540,7 +1597,7 @@ function renderWebinarPerfDetail(e){
   return `${topbar()}${crumbs()}
   ${backBtn}
   <div class="drip-card" style="overflow:hidden;">
-    <div style="position:relative;">
+    <div style="position:relative;"${bannerLpAttrs(e, 'aspect-ratio:16/9;')}>
       ${webinarBannerHtml(e, 'aspect-ratio:16/9;', e.bannerImageWideKey || e.bannerImageKey)}
       ${recordingPlayOverlay(e.recordingLink, 64)}
     </div>
@@ -1676,6 +1733,7 @@ async function renderWebinarExecutionView(){
     if(!seenKeys.has(key)) merged.push(x);
   }
   merged.sort((a,b)=> (a.date||'zzz').localeCompare(b.date||'zzz'));
+  webinarExecMergedById = new Map(merged.map(e=>[e.id, e]));
 
   if(state.webinarExecId){
     const entry = merged.find(e => e.id===state.webinarExecId);
@@ -1702,7 +1760,10 @@ async function renderWebinarExecutionView(){
     const region = webinarRegion(e.market);
     const doneCount = EXECUTION_STEPS.filter(s => execStepVal(e, s.key, 'status')==='Done').length;
     return `<div class="card" style="padding:0;overflow:hidden;" data-nav="webinar-exec-detail" data-id="${e.id}">
-      ${execCardVisual(e)}
+      <div style="position:relative;">
+        ${execCardVisual(e)}
+        ${cardEditButton('webinar-exec-card-edit', e.id, 'Edit checklist')}
+      </div>
       <div style="padding:14px 16px;">
         <h3 style="font-size:14.5px;margin:0 0 6px;">${esc(e.topic||'Untitled')}</h3>
         <div class="meta">📅 ${esc(formatDateDisplay(e.date)||'Date TBD')}</div>
@@ -1728,7 +1789,6 @@ async function renderWebinarExecutionView(){
       <option value="all"${(!state.weekFilter||state.weekFilter==='all')?' selected':''}>All weeks</option>
       ${weeks.map(w=>`<option value="${w.key}"${state.weekFilter===w.key?' selected':''}>${esc(w.label)}</option>`).join('')}
     </select>` : ''}
-    ${editMode? `<button class="btn" data-action="add-webinar-entry">+ Add webinar</button>`:''}
   </div>
   ${cardsHtml}`;
 }
@@ -1971,13 +2031,6 @@ async function renderCountryPicker(){
 }
 
 function fieldKey(){ return state.section+'_'+state.channel; }
-
-// Entries added via "+ Add webinar" from Performance/Execution are really
-// Calendar-kind entries (that's what the perf/exec merge matches against),
-// but we want the page underneath the modal to stay on Performance/Execution
-// instead of visibly switching to Calendar. state.modal.kindOverride carries
-// that "save as calendar" intent without touching state.section.
-function activeFieldKey(){ return ((state.modal && state.modal.kindOverride) || state.section)+'_'+state.channel; }
 
 function filterEntries(entries){
   if(!state.search) return entries;
@@ -2494,7 +2547,7 @@ function renderDripGroups(shown, comments, fields){
 }
 
 function entryModal(entry){
-  const fields = FIELD_SETS[activeFieldKey()];
+  const fields = FIELD_SETS[fieldKey()];
   const isEdit = !!entry;
   const fieldsHtml = fields.map(f=>{
     const val = entry ? esc(entry[f.key]) : '';
@@ -2646,6 +2699,40 @@ async function render(){
   app.innerHTML = html;
   document.getElementById('sidebar').innerHTML = renderSidebar();
   bindEvents();
+  hydrateLinkPreviews();
+}
+
+// Recording links that aren't YouTube (no predictable CDN thumbnail URL, e.g.
+// LinkedIn posts, Vimeo) get their thumbnail fetched from the backend
+// (/api/link-preview, which reads the link's og:image) after the initial
+// render, then swapped in - keeps first paint instant instead of blocking
+// the whole page on a network round-trip per card.
+const linkPreviewCache = new Map();
+function getLinkPreviewImage(link){
+  if(!linkPreviewCache.has(link)){
+    linkPreviewCache.set(link, fetch('/api/link-preview?url='+encodeURIComponent(link))
+      .then(r=> r.ok ? r.json() : null)
+      .then(j=> (j && j.image) || null)
+      .catch(()=> null));
+  }
+  return linkPreviewCache.get(link);
+}
+async function hydrateLinkPreviews(){
+  const targets = Array.from(document.querySelectorAll('[data-recording-link]')).filter(el=>!el.querySelector('img'));
+  for(const el of targets){
+    const link = el.dataset.recordingLink;
+    const imgUrl = await getLinkPreviewImage(link);
+    if(!imgUrl || !el.isConnected || el.querySelector('img')) continue;
+    const placeholder = el.querySelector(':scope > div');
+    const imgEl = document.createElement('img');
+    imgEl.alt = '';
+    imgEl.style.cssText = `width:100%;${el.dataset.lpSize||'aspect-ratio:1/1;'}object-fit:cover;border-radius:12px 12px 0 0;display:block;`;
+    imgEl.addEventListener('error', ()=>{
+      imgEl.outerHTML = bannerPlaceholderHtml(el.dataset.lpTopic, el.dataset.lpSize);
+    }, {once:true});
+    imgEl.src = imgUrl;
+    if(placeholder) el.replaceChild(imgEl, placeholder); else el.prepend(imgEl);
+  }
 }
 
 function bindEvents(){
@@ -2678,6 +2765,33 @@ function bindEvents(){
 
   app.querySelectorAll('[data-action="watch-recording"]').forEach(a=>{
     a.addEventListener('click', ev=>ev.stopPropagation());
+  });
+
+  // 'error' doesn't bubble on <img>, so each one needs its own listener
+  // rather than event delegation. {once:true} since outerHTML replaces the
+  // element itself, detaching this listener anyway.
+  app.querySelectorAll('img[data-img-fallback-topic]').forEach(img=>{
+    img.addEventListener('error', function(){
+      this.outerHTML = bannerPlaceholderHtml(this.dataset.imgFallbackTopic, this.dataset.imgFallbackSize);
+    }, {once:true});
+  });
+
+  app.querySelectorAll('[data-action="webinar-perf-card-edit"]').forEach(btn=>{
+    btn.addEventListener('click', ev=>{
+      ev.stopPropagation();
+      const entry = webinarPerfMergedById.get(btn.dataset.id);
+      if(entry) state.webinarPerfModal = entry;
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="webinar-exec-card-edit"]').forEach(btn=>{
+    btn.addEventListener('click', ev=>{
+      ev.stopPropagation();
+      const entry = webinarExecMergedById.get(btn.dataset.id);
+      if(entry) state.webinarExecModal = entry;
+      render();
+    });
   });
 
   const webinarPerfBackBtn = app.querySelector('[data-action="webinar-perf-back"]');
@@ -2886,8 +3000,7 @@ function bindEvents(){
 
   const saveBtn = app.querySelector('[data-action="modal-save"]');
   if(saveBtn) saveBtn.addEventListener('click', async ()=>{
-    const kind = (state.modal && state.modal.kindOverride) || state.section;
-    const fields = FIELD_SETS[activeFieldKey()];
+    const fields = FIELD_SETS[fieldKey()];
     const vals = {};
     fields.forEach(f=>{
       const inp = app.querySelector(`[data-f="${f.key}"]`);
@@ -2899,7 +3012,7 @@ function bindEvents(){
       const idx = data.entries.findIndex(e=>e.id===id);
       data.entries[idx] = {...data.entries[idx], ...vals, updatedAt:Date.now()};
     } else {
-      data.entries.push({id:uid(), channel:state.channel, kind, group:state.group, country:state.country, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
+      data.entries.push({id:uid(), channel:state.channel, kind:state.section, group:state.group, country:state.country, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
     }
     await saveQData(state.quarter);
     state.modal = null;
@@ -2981,16 +3094,6 @@ function bindEvents(){
     }
     await saveQData(state.quarter);
     state.webinarExecModal = null;
-    render();
-  });
-
-  const addWebinarEntryBtn = app.querySelector('[data-action="add-webinar-entry"]');
-  if(addWebinarEntryBtn) addWebinarEntryBtn.addEventListener('click', ()=>{
-    // Reuse the Calendar section's generic add-entry modal (FIELD_SETS.calendar_webinar)
-    // so a brand-new webinar can be logged directly from Performance/Execution, without
-    // ever switching state.section — kindOverride tells the modal/save handler to treat
-    // this as a calendar-kind entry while the page underneath stays on Performance/Execution.
-    state.modal = {entry:null, kindOverride:'calendar'};
     render();
   });
 
