@@ -45,12 +45,12 @@ app.get('/api/health', (_req, res) => {
 // API Routes Aggregator
 app.use('/api', apiRouter);
 
-// Fallback route to serve index.html for single page frontend apps
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api')) {
-    return next();
-  }
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+// Fallback so /wave-tracker (and any sub-path under it) still loads the
+// single-page app - scoped to /wave-tracker rather than every path, so this
+// project can host other things at the domain root later without the app
+// swallowing those routes too.
+app.get(['/wave-tracker', '/wave-tracker/*'], (_req, res) => {
+  res.sendFile(path.join(__dirname, '../public/wave-tracker/index.html'));
 });
 
 // Global Centralized Error Handling Middleware
