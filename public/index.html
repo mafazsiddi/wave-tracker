@@ -465,6 +465,7 @@ const FIELD_SETS = {
     {key:'recordingLink', label:'Recording link', type:'text'},
     {key:'registrationLink', label:'Registration page link', type:'text'},
     {key:'bannerFolderLink', label:'Banner creatives folder link', type:'text'},
+    {key:'bannerThumbLink', label:'Banner thumbnail (single image/file link)', type:'text'},
     {key:'linkedinPosts', label:'LinkedIn posts shared (count)', type:'number'}
   ]
 };
@@ -1352,6 +1353,19 @@ function driveThumbFromLink(link){
   return m ? `https://drive.google.com/thumbnail?id=${m[1]}&sz=w1000` : null;
 }
 
+// "Banner creatives folder link" is typically a whole Drive folder, which has
+// no public single-image thumbnail endpoint - so thumbnails are sourced from
+// the separate "Banner thumbnail" field instead, where an editor pastes ONE
+// representative image/file link. Resolves it when that link is a single
+// Drive file (driveThumbFromLink) or already points directly at an image;
+// anything else just renders no thumbnail (still shows the plain text link).
+function bannerCreativeThumbFromLink(link){
+  if(!link) return null;
+  const drive = driveThumbFromLink(link);
+  if(drive) return drive;
+  return /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(String(link)) ? link : null;
+}
+
 // Marks the banner wrapper for lazy hydration (see hydrateLinkPreviews) when
 // there's a recording link but no synchronous thumbnail available yet - the
 // wrapper carries enough info (link + sizing) for the hydration pass to fetch
@@ -1523,9 +1537,99 @@ function statBox(value, label){
   return `<div class="qs"><div class="v" style="font-size:15px;">${esc(value||'—')}</div><div class="l">${esc(label)}</div></div>`;
 }
 
+// Minimal RFC4180 CSV parser - handles quoted fields (embedded commas,
+// newlines, "" escaped quotes). No library needed for a leads-list this
+// small, and it keeps the app's zero-dependency, paste/upload-in-browser
+// pattern used elsewhere (e.g. the touchpoint notes parser).
+function parseCsv(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  const s = String(text||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  for(let i=0;i<s.length;i++){
+    const c = s[i];
+    if(inQuotes){
+      if(c==='"'){ if(s[i+1]==='"'){ field+='"'; i++; } else inQuotes=false; }
+      else field += c;
+    } else {
+      if(c==='"') inQuotes = true;
+      else if(c===','){ row.push(field); field=''; }
+      else if(c==='\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else field += c;
+    }
+  }
+  row.push(field);
+  rows.push(row);
+  return rows.filter(r => r.some(c=>String(c).trim()!==''));
+}
+
+// Column names are matched loosely (case-insensitive, a few common synonyms)
+// since leads exports come from different platforms (Zoom, webinar tools,
+// hand-built sheets) with slightly different headers - unmatched columns are
+// just ignored rather than failing the whole import.
+async function importLeadsCsv(file){
+  const entry = currentWebinarPerfEntry;
+  if(!entry) return;
+  const text = await file.text();
+  const rows = parseCsv(text);
+  if(rows.length < 2){ await customAlert("That CSV doesn't look like it has any data rows."); return; }
+  const header = rows[0].map(h=>String(h||'').trim().toLowerCase());
+  const col = (...names) => { for(const n of names){ const i = header.indexOf(n); if(i!==-1) return i; } return -1; };
+  const idx = {
+    name: col('name','full name'),
+    email: col('email','email address'),
+    company: col('company','organization','organisation'),
+    designation: col('designation','title','job title'),
+    location: col('location','country'),
+    attended: col('attended'),
+    tag: col('tag'),
+    primaryCallingStatus: col('primary calling status','primary status'),
+    secondaryCallingStatus: col('secondary calling status','secondary status'),
+    callingComment: col('calling comments','calling comment','comments','comment','notes')
+  };
+  const truthy = v => /^(y|yes|true|1)$/i.test(String(v||'').trim());
+  const get = (r,i) => i>=0 ? String(r[i]||'').trim() : '';
+  const newRegistrants = rows.slice(1).map(r=>({
+    name: get(r,idx.name), email: get(r,idx.email), company: get(r,idx.company),
+    designation: get(r,idx.designation), location: get(r,idx.location),
+    attended: truthy(get(r,idx.attended)), tag: get(r,idx.tag),
+    primaryCallingStatus: get(r,idx.primaryCallingStatus), secondaryCallingStatus: get(r,idx.secondaryCallingStatus),
+    callingComment: get(r,idx.callingComment), internal: false
+  })).filter(p=>p.name || p.email);
+
+  if(!newRegistrants.length){ await customAlert("No usable rows found — make sure the CSV has a Name or Email column."); return; }
+
+  const data = await loadQData(state.quarter);
+  if(entry.perfId){
+    const perfIdx = data.entries.findIndex(x=>x.id===entry.perfId);
+    const existing = data.entries[perfIdx].registrants || [];
+    data.entries[perfIdx] = {...data.entries[perfIdx], registrants: existing.concat(newRegistrants), updatedAt:Date.now()};
+  } else {
+    // No performance report exists yet for this webinar - importing leads
+    // creates one (same "fresh performance record gets its own id" pattern
+    // as webinarPerfModalSave), so the leads don't get stranded with nowhere
+    // to be saved to.
+    const newId = uid();
+    data.entries.push({id:newId, channel:'webinar', kind:'performance', market:entry.market, topic:entry.topic, date:entry.date, registrants:newRegistrants, updatedAt:Date.now(), createdAt:Date.now()});
+    state.webinarPerfId = newId;
+  }
+  await saveQData(state.quarter);
+  await customAlert(`Imported ${newRegistrants.length} lead${newRegistrants.length===1?'':'s'}.`);
+  render();
+}
+
 function renderWebinarLeadsSection(e){
   const all = e.registrants || [];
-  if(!all.length) return '';
+  const importControl = editMode ? `<button class="btn ghost small" data-action="leads-import">⬆ Import CSV</button><input type="file" accept=".csv" data-role="leads-csv-input" style="display:none;">` : '';
+  if(!all.length){
+    if(!editMode) return '';
+    return `<div class="drip-card" style="margin-top:18px;">
+      <div class="drip-card-header" style="display:flex;justify-content:space-between;align-items:center;">
+        <div class="drip-card-title">Leads &amp; call tracking</div>
+        ${importControl}
+      </div>
+      <div style="padding:14px 18px;color:var(--muted);font-size:13px;">No leads imported yet.</div>
+    </div>`;
+  }
 
   const tags = Array.from(new Set(all.map(p=>p.tag).filter(Boolean)));
   const designations = Array.from(new Set(all.map(p=>p.designation).filter(Boolean))).sort();
@@ -1537,9 +1641,12 @@ function renderWebinarLeadsSection(e){
 
   if(!state.leadsExpanded){
     return `<div class="drip-card" style="margin-top:18px;">
-      <div class="drip-card-header" style="display:flex;justify-content:space-between;align-items:center;">
+      <div class="drip-card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
         <div class="drip-card-title">Leads &amp; call tracking</div>
-        <button class="btn ghost small" data-action="leads-toggle">Show full list ▾</button>
+        <div style="display:flex;gap:8px;align-items:center;">
+          ${importControl}
+          <button class="btn ghost small" data-action="leads-toggle">Show full list ▾</button>
+        </div>
       </div>
       <div style="padding:14px 18px;">
         <span class="stat-pill">${all.length} lead${all.length===1?'':'s'}</span>
@@ -1549,9 +1656,12 @@ function renderWebinarLeadsSection(e){
   }
 
   return `<div class="drip-card" style="margin-top:18px;">
-    <div class="drip-card-header" style="display:flex;justify-content:space-between;align-items:center;">
+    <div class="drip-card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <div class="drip-card-title">Leads &amp; call tracking (${filtered.length}${filtered.length!==all.length? ' of '+all.length:''})</div>
-      <button class="btn ghost small" data-action="leads-toggle">Collapse ▴</button>
+      <div style="display:flex;gap:8px;align-items:center;">
+        ${importControl}
+        <button class="btn ghost small" data-action="leads-toggle">Collapse ▴</button>
+      </div>
     </div>
     <div style="padding:10px 18px 0;display:flex;gap:10px;flex-wrap:wrap;">
       <select class="search" style="max-width:170px;" data-role="leads-tag-filter">
@@ -1668,6 +1778,9 @@ function renderWebinarPerfDetail(e){
       <div>📊 Deck: ${e.deckLink? renderCellValue(e.deckLink,true,false) : '<span style="color:var(--muted);">Not added yet</span>'}</div>
       <div>📝 Registration page: ${e.registrationLink? renderCellValue(e.registrationLink,true,false) : '<span style="color:var(--muted);">Not added yet</span>'}</div>
       <div>🖼️ Banner creatives: ${e.bannerFolderLink? renderCellValue(e.bannerFolderLink,true,false) : '<span style="color:var(--muted);">Not added yet</span>'}</div>
+      <div>🖼️ Banner thumbnail: ${e.bannerThumbLink? renderCellValue(e.bannerThumbLink,true,false) : '<span style="color:var(--muted);">Not added yet</span>'}
+        ${bannerCreativeThumbFromLink(e.bannerThumbLink) ? `<div style="margin-top:6px;"><img src="${esc(bannerCreativeThumbFromLink(e.bannerThumbLink))}" alt="" data-img-fallback-hide="1" style="width:140px;aspect-ratio:16/9;object-fit:cover;border-radius:8px;display:block;border:1px solid var(--line);"></div>` : ''}
+      </div>
       <div>📣 LinkedIn posts shared: ${e.linkedinPosts? esc(String(e.linkedinPosts)) : '<span style="color:var(--muted);">Not logged yet</span>'}
         ${(e.linkedinPostLinks && e.linkedinPostLinks.length) ? `<div style="margin-top:4px;">${e.linkedinPostLinks.map((l,i)=>`<div>${renderCellValue(l,true,false)}</div>`).join('')}</div>` : ''}
       </div>
@@ -1845,6 +1958,36 @@ function renderWebinarExecutionDetail(e){
     </tr>`;
   }).join('');
 
+  const customStepRows = (e.customSteps||[]).map(r=>{
+    const status = r.status || 'Not started';
+    return `<tr>
+      <td>${esc(r.label||'')}</td>
+      <td>${esc(r.owner)||'<span style="color:var(--muted);">—</span>'}</td>
+      <td><span class="status-badge status-${status.replace(/[^A-Za-z]/g,'')}">${esc(status)}</span></td>
+      <td class="notes-cell">${esc(r.notes||'')}</td>
+    </tr>`;
+  }).join('');
+
+  const customDistRows = (e.customDistChannels||[]).map(r=>{
+    const status = r.status || 'Not started';
+    return `<tr>
+      <td>${esc(r.label||'')}</td>
+      <td>${esc(r.target)||'—'}</td>
+      <td>${esc(r.current)||'—'}</td>
+      <td><span class="status-badge status-${status.replace(/[^A-Za-z]/g,'')}">${esc(status)}</span></td>
+      <td class="notes-cell">${esc(r.notes||'')}</td>
+    </tr>`;
+  }).join('');
+
+  const customLinkRows = (e.customLinks||[]).map(r=>{
+    const status = r.status || 'Not started';
+    return `<tr>
+      <td>${esc(r.label||'')}</td>
+      <td>${r.link? renderCellValue(r.link,true,false) : '<span style="color:var(--muted);">Not created yet</span>'}</td>
+      <td><span class="status-badge status-${status.replace(/[^A-Za-z]/g,'')}">${esc(status)}</span></td>
+    </tr>`;
+  }).join('');
+
   return `${topbar()}${crumbs()}
   ${backBtn}
   <div class="drip-card" style="overflow:hidden;">
@@ -1863,7 +2006,7 @@ function renderWebinarExecutionDetail(e){
     <div class="drip-card-header"><div class="drip-card-title">Checklist</div></div>
     <table class="drip-table">
       <thead><tr><th>Step</th><th>Owner</th><th>Status</th><th>Notes</th></tr></thead>
-      <tbody>${stepRows}</tbody>
+      <tbody>${stepRows}${customStepRows}</tbody>
     </table>
   </div>
 
@@ -1871,7 +2014,7 @@ function renderWebinarExecutionDetail(e){
     <div class="drip-card-header"><div class="drip-card-title">e. Channel distribution</div></div>
     <table class="drip-table">
       <thead><tr><th>Channel</th><th>Target</th><th>Current</th><th>Status</th><th>Notes</th></tr></thead>
-      <tbody>${distRows}</tbody>
+      <tbody>${distRows}${customDistRows}</tbody>
     </table>
   </div>
 
@@ -1879,7 +2022,7 @@ function renderWebinarExecutionDetail(e){
     <div class="drip-card-header"><div class="drip-card-title">f. Links created</div></div>
     <table class="drip-table">
       <thead><tr><th>Link</th><th>URL</th><th>Status</th></tr></thead>
-      <tbody>${linkRows}</tbody>
+      <tbody>${linkRows}${customLinkRows}</tbody>
     </table>
   </div>`;
 }
@@ -2567,12 +2710,27 @@ function entryModal(entry){
   </div>`;
 }
 
+// Renders one link input per LinkedIn post the count field says were shared,
+// pre-filling from existingLinks by index (index i keeps its old value across
+// a count change, so growing/shrinking the count doesn't scramble already-
+// typed links - see the data-pf="linkedinPosts" input listener in bindEvents,
+// which rebuilds this same markup on every keystroke).
+function linkedinPostLinkRowsHtml(count, existingLinks){
+  return Array.from({length:count}, (_,i)=>`<div class="field" style="margin:8px 0 0 16px;"><label>LinkedIn post ${i+1} link</label><input type="text" data-pf-link-idx="${i}" value="${esc((existingLinks&&existingLinks[i])||'')}"></div>`).join('');
+}
+
 function webinarPerfModal(entry){
   const fields = FIELD_SETS.performance_webinar;
+  const initialLinkCount = Math.max(0, parseInt(entry.linkedinPosts, 10) || 0);
   const fieldsHtml = fields.map(f=>{
     const val = esc(entry[f.key]);
     if(f.type==='textarea') return `<div class="field"><label>${f.label}</label><textarea data-pf="${f.key}">${val}</textarea></div>`;
-    return `<div class="field"><label>${f.label}</label><input type="${f.type}" data-pf="${f.key}" value="${val}"></div>`;
+    const input = `<div class="field"><label>${f.label}</label><input type="${f.type}" data-pf="${f.key}" value="${val}"></div>`;
+    // linkedinPosts is the count field - the per-post link inputs are
+    // generated (and kept in sync) below it, not defined as a FIELD_SETS
+    // entry themselves since their number is dynamic.
+    if(f.key==='linkedinPosts') return input + `<div id="linkedinPostLinksWrap">${linkedinPostLinkRowsHtml(initialLinkCount, entry.linkedinPostLinks)}</div>`;
+    return input;
   }).join('');
   return `<div class="modal-bg" data-action="webinar-perf-modal-bg">
     <div class="modal" data-stop>
@@ -2590,6 +2748,59 @@ function execStatusSelect(name, current){
   return `<select data-ef="${name}">${EXEC_STATUS_OPTIONS.map(o=>
     `<option ${(current||'Not started')===o?'selected':''}>${o}</option>`
   ).join('')}</select>`;
+}
+
+// Custom rows go beyond the fixed EXECUTION_STEPS/DIST_CHANNELS/LINKS lists,
+// so unlike those they need their own editable label and a way to remove
+// them again. Rows are identified structurally (data-custom-row wrapper +
+// data-cf field markers) rather than by index, so add/remove is just DOM
+// insertion/removal - no renumbering, and the Save handler collects
+// whatever's currently in the DOM in document order.
+function customExecRowHtml(group, row){
+  row = row || {};
+  const statusSelect = `<select data-cf="status">${EXEC_STATUS_OPTIONS.map(o=>`<option ${(row.status||'Not started')===o?'selected':''}>${o}</option>`).join('')}</select>`;
+  const removeBtn = `<button class="btn ghost small" data-action="remove-custom-row" style="flex-shrink:0;">🗑 Remove</button>`;
+  if(group==='step'){
+    return `<div class="drip-card" data-custom-row="step" style="margin-bottom:10px;padding:12px 14px;">
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px;">
+        <div class="field" style="margin:0;flex:1;"><label>Step</label><input type="text" data-cf="label" value="${esc(row.label||'')}" placeholder="e.g. i. Post-webinar recap email"></div>
+        ${removeBtn}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 140px;gap:8px;">
+        <div class="field" style="margin:0;"><label>Owner</label><input type="text" data-cf="owner" value="${esc(row.owner||'')}"></div>
+        <div class="field" style="margin:0;"><label>Status</label>${statusSelect}</div>
+      </div>
+      <div class="field" style="margin:8px 0 0;"><label>Notes</label><input type="text" data-cf="notes" value="${esc(row.notes||'')}"></div>
+    </div>`;
+  }
+  if(group==='dist'){
+    return `<div class="drip-card" data-custom-row="dist" style="margin-bottom:10px;padding:12px 14px;">
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px;">
+        <div class="field" style="margin:0;flex:1;"><label>Channel</label><input type="text" data-cf="label" value="${esc(row.label||'')}" placeholder="e.g. WhatsApp broadcast"></div>
+        ${removeBtn}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 140px;gap:8px;">
+        <div class="field" style="margin:0;"><label>Target</label><input type="text" data-cf="target" value="${esc(row.target||'')}"></div>
+        <div class="field" style="margin:0;"><label>Current</label><input type="text" data-cf="current" value="${esc(row.current||'')}"></div>
+        <div class="field" style="margin:0;"><label>Status</label>${statusSelect}</div>
+      </div>
+      <div class="field" style="margin:8px 0 0;"><label>Notes</label><input type="text" data-cf="notes" value="${esc(row.notes||'')}"></div>
+    </div>`;
+  }
+  return `<div class="drip-card" data-custom-row="link" style="margin-bottom:10px;padding:12px 14px;">
+    <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px;">
+      <div class="field" style="margin:0;flex:1;"><label>Link name</label><input type="text" data-cf="label" value="${esc(row.label||'')}" placeholder="e.g. Feedback form"></div>
+      ${removeBtn}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 140px;gap:8px;">
+      <div class="field" style="margin:0;"><label>URL</label><input type="text" data-cf="link" value="${esc(row.link||'')}"></div>
+      <div class="field" style="margin:0;"><label>Status</label>${statusSelect}</div>
+    </div>
+  </div>`;
+}
+
+function customExecRowWrapId(group){
+  return group==='step' ? 'customStepsWrap' : group==='dist' ? 'customDistWrap' : 'customLinksWrap';
 }
 
 function webinarExecModal(entry){
@@ -2623,15 +2834,28 @@ function webinarExecModal(entry){
       </div>
     </div>`).join('');
 
+  const customStepsHtml = (entry.customSteps||[]).map(r=>customExecRowHtml('step', r)).join('');
+  const customDistHtml = (entry.customDistChannels||[]).map(r=>customExecRowHtml('dist', r)).join('');
+  const customLinksHtml = (entry.customLinks||[]).map(r=>customExecRowHtml('link', r)).join('');
+
   return `<div class="modal-bg" data-action="webinar-exec-modal-bg">
     <div class="modal" data-stop style="max-width:640px;">
       <h3>Edit execution checklist — ${esc(entry.topic||'Untitled')}</h3>
       <div class="drip-card-title" style="margin-bottom:8px;">Checklist</div>
       ${stepsHtml}
+      <div id="customStepsWrap">${customStepsHtml}</div>
+      <button class="btn ghost small" data-action="add-custom-row" data-group="step" style="margin-bottom:6px;">+ Add row</button>
+
       <div class="drip-card-title" style="margin:16px 0 8px;">Channel distribution</div>
       ${distHtml}
+      <div id="customDistWrap">${customDistHtml}</div>
+      <button class="btn ghost small" data-action="add-custom-row" data-group="dist" style="margin-bottom:6px;">+ Add row</button>
+
       <div class="drip-card-title" style="margin:16px 0 8px;">Links created</div>
       ${linksHtml}
+      <div id="customLinksWrap">${customLinksHtml}</div>
+      <button class="btn ghost small" data-action="add-custom-row" data-group="link" style="margin-bottom:6px;">+ Add row</button>
+
       <div class="modal-actions">
         <button class="btn ghost" data-action="webinar-exec-modal-cancel">Cancel</button>
         <button class="btn" data-action="webinar-exec-modal-save">Save</button>
@@ -2774,6 +2998,13 @@ function bindEvents(){
     img.addEventListener('error', function(){
       this.outerHTML = bannerPlaceholderHtml(this.dataset.imgFallbackTopic, this.dataset.imgFallbackSize);
     }, {once:true});
+  });
+
+  // Small inline thumbnails (e.g. banner creatives in the assets card) have
+  // no placeholder art worth showing on a broken/private link - just hide
+  // the row entirely rather than leaving a broken-image icon.
+  app.querySelectorAll('img[data-img-fallback-hide]').forEach(img=>{
+    img.addEventListener('error', function(){ this.remove(); }, {once:true});
   });
 
   app.querySelectorAll('[data-action="webinar-perf-card-edit"]').forEach(btn=>{
@@ -2926,6 +3157,17 @@ function bindEvents(){
   const leadsToggleBtn = app.querySelector('[data-action="leads-toggle"]');
   if(leadsToggleBtn) leadsToggleBtn.addEventListener('click', ()=>{ state.leadsExpanded = !state.leadsExpanded; render(); });
 
+  const leadsImportBtn = app.querySelector('[data-action="leads-import"]');
+  const leadsCsvInput = app.querySelector('[data-role="leads-csv-input"]');
+  if(leadsImportBtn && leadsCsvInput){
+    leadsImportBtn.addEventListener('click', ()=> leadsCsvInput.click());
+    leadsCsvInput.addEventListener('change', async ()=>{
+      const file = leadsCsvInput.files && leadsCsvInput.files[0];
+      leadsCsvInput.value = '';
+      if(file) await importLeadsCsv(file);
+    });
+  }
+
   const leadsTagSelect = app.querySelector('[data-role="leads-tag-filter"]');
   if(leadsTagSelect) leadsTagSelect.addEventListener('change', (e)=>{ state.leadsTagFilter = e.target.value; render(); });
 
@@ -3031,12 +3273,25 @@ function bindEvents(){
   const webinarPerfModalCancel = app.querySelector('[data-action="webinar-perf-modal-cancel"]');
   if(webinarPerfModalCancel) webinarPerfModalCancel.addEventListener('click', ()=>{ state.webinarPerfModal=null; render(); });
 
+  // Regenerates the LinkedIn post link inputs whenever the count field
+  // changes, carrying over already-typed link values by index so editing the
+  // count doesn't wipe links the user already entered.
+  const linkedinCountInput = app.querySelector('[data-pf="linkedinPosts"]');
+  if(linkedinCountInput) linkedinCountInput.addEventListener('input', ()=>{
+    const wrap = app.querySelector('#linkedinPostLinksWrap');
+    if(!wrap) return;
+    const existing = Array.from(wrap.querySelectorAll('[data-pf-link-idx]')).map(inp=>inp.value);
+    const count = Math.max(0, parseInt(linkedinCountInput.value, 10) || 0);
+    wrap.innerHTML = linkedinPostLinkRowsHtml(count, existing);
+  });
+
   const webinarPerfModalSave = app.querySelector('[data-action="webinar-perf-modal-save"]');
   if(webinarPerfModalSave) webinarPerfModalSave.addEventListener('click', async ()=>{
     const entry = state.webinarPerfModal;
     const fields = FIELD_SETS.performance_webinar;
     const vals = {};
     fields.forEach(f=>{ vals[f.key] = app.querySelector(`[data-pf="${f.key}"]`).value; });
+    vals.linkedinPostLinks = Array.from(app.querySelectorAll('[data-pf-link-idx]')).map(inp=>inp.value.trim()).filter(Boolean);
     const data = await loadQData(state.quarter);
     if(entry.perfId){
       const idx = data.entries.findIndex(x=>x.id===entry.perfId);
@@ -3067,6 +3322,27 @@ function bindEvents(){
   const webinarExecModalCancel = app.querySelector('[data-action="webinar-exec-modal-cancel"]');
   if(webinarExecModalCancel) webinarExecModalCancel.addEventListener('click', ()=>{ state.webinarExecModal=null; render(); });
 
+  // Adding a row does direct DOM insertion (not render()) so any text the
+  // user has already typed elsewhere in this modal isn't discarded - a full
+  // re-render would rebuild every input from the original entry data.
+  app.querySelectorAll('[data-action="add-custom-row"]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const group = btn.dataset.group;
+      const wrap = document.getElementById(customExecRowWrapId(group));
+      if(!wrap) return;
+      wrap.insertAdjacentHTML('beforeend', customExecRowHtml(group, {}));
+      const newRow = wrap.lastElementChild;
+      const removeBtn = newRow.querySelector('[data-action="remove-custom-row"]');
+      if(removeBtn) removeBtn.addEventListener('click', ()=> newRow.remove());
+    });
+  });
+  app.querySelectorAll('[data-action="remove-custom-row"]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const row = btn.closest('[data-custom-row]');
+      if(row) row.remove();
+    });
+  });
+
   const webinarExecModalSave = app.querySelector('[data-action="webinar-exec-modal-save"]');
   if(webinarExecModalSave) webinarExecModalSave.addEventListener('click', async ()=>{
     const entry = state.webinarExecModal;
@@ -3082,14 +3358,25 @@ function bindEvents(){
       bag[key] = bag[key] || {};
       bag[key][field] = inp.value;
     });
+    // Custom rows are read straight from the DOM in document order rather
+    // than tracked by index, since add/remove just inserts/deletes elements -
+    // a row with no label typed in gets dropped rather than saved as blank.
+    const collectCustomRows = (group, fields) => Array.from(document.querySelectorAll(`[data-custom-row="${group}"]`)).map(row=>{
+      const out = {};
+      fields.forEach(f=>{ const el = row.querySelector(`[data-cf="${f}"]`); out[f] = el ? el.value.trim() : ''; });
+      return out;
+    }).filter(r=>r.label);
+    const customSteps = collectCustomRows('step', ['label','owner','status','notes']);
+    const customDistChannels = collectCustomRows('dist', ['label','target','current','status','notes']);
+    const customLinks = collectCustomRows('link', ['label','link','status']);
     if(existingIdx>=0){
-      data.entries[existingIdx] = {...existing, execSteps, execDistribution, execLinks, updatedAt:Date.now()};
+      data.entries[existingIdx] = {...existing, execSteps, execDistribution, execLinks, customSteps, customDistChannels, customLinks, updatedAt:Date.now()};
     } else {
       // Same id-repointing as the performance modal - a fresh execution
       // record gets a new id, so keep webinarExecId in sync or the detail
       // view falls through to the library right after saving.
       const newId = uid();
-      data.entries.push({id:newId, channel:'webinar', kind:'execution', market:entry.market, topic:entry.topic, date:entry.date, execSteps, execDistribution, execLinks, updatedAt:Date.now(), createdAt:Date.now()});
+      data.entries.push({id:newId, channel:'webinar', kind:'execution', market:entry.market, topic:entry.topic, date:entry.date, execSteps, execDistribution, execLinks, customSteps, customDistChannels, customLinks, updatedAt:Date.now(), createdAt:Date.now()});
       state.webinarExecId = newId;
     }
     await saveQData(state.quarter);
