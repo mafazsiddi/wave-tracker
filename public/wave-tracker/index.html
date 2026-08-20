@@ -1429,6 +1429,15 @@ function cardEditButton(action, id, label){
   return `<button class="btn small" data-action="${action}" data-id="${id}" title="${esc(label)}" style="position:absolute;top:8px;right:8px;width:30px;height:30px;padding:0;border-radius:50%;line-height:1;">✏️</button>`;
 }
 
+// Trash button rendered to the left of cardEditButton's pencil, same corner
+// treatment but styled danger-red. Only shown in edit mode; stopPropagation
+// (bound in bindEvents) keeps the click from also triggering the card's own
+// data-nav.
+function cardDeleteButton(action, id, label){
+  if(!editMode) return '';
+  return `<button class="btn small danger" data-action="${action}" data-id="${id}" title="${esc(label||'Delete')}" style="position:absolute;top:8px;right:44px;width:30px;height:30px;padding:0;border-radius:50%;line-height:1;">🗑️</button>`;
+}
+
 // Execution Tracker cards use a region badge instead of a creative - a round
 // map/globe emblem labeled with the region (GCC/EU/India/SEA/Global), since
 // there's no banner to show yet at the planning stage.
@@ -1506,6 +1515,7 @@ async function renderWebinarPerformanceView(){
       <div style="position:relative;"${bannerLpAttrs(e)}>
         ${webinarBannerHtml(e)}
         ${cardEditButton('webinar-perf-card-edit', e.id, e.perfId?'Edit report':'Add report')}
+        ${cardDeleteButton('webinar-perf-card-del', e.id, 'Delete')}
       </div>
       <div style="padding:14px 16px;">
         <h3 style="font-size:14.5px;margin:0 0 6px;">${esc(e.topic||'Untitled')}</h3>
@@ -1877,6 +1887,7 @@ async function renderWebinarExecutionView(){
       <div style="position:relative;">
         ${execCardVisual(e)}
         ${cardEditButton('webinar-exec-card-edit', e.id, 'Edit checklist')}
+        ${cardDeleteButton('webinar-exec-card-del', e.id, 'Delete')}
       </div>
       <div style="padding:14px 16px;">
         <h3 style="font-size:14.5px;margin:0 0 6px;">${esc(e.topic||'Untitled')}</h3>
@@ -3027,6 +3038,30 @@ function bindEvents(){
       ev.stopPropagation();
       const entry = webinarExecMergedById.get(btn.dataset.id);
       if(entry) state.webinarExecModal = entry;
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="webinar-perf-card-del"]').forEach(btn=>{
+    btn.addEventListener('click', async ev=>{
+      ev.stopPropagation();
+      const ok = await customConfirm("Delete this webinar?");
+      if(!ok) return;
+      const data = await loadQData(state.quarter);
+      data.entries = data.entries.filter(x=>x.id!==btn.dataset.id);
+      await saveQData(state.quarter);
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="webinar-exec-card-del"]').forEach(btn=>{
+    btn.addEventListener('click', async ev=>{
+      ev.stopPropagation();
+      const ok = await customConfirm("Delete this webinar?");
+      if(!ok) return;
+      const data = await loadQData(state.quarter);
+      data.entries = data.entries.filter(x=>x.id!==btn.dataset.id);
+      await saveQData(state.quarter);
       render();
     });
   });
