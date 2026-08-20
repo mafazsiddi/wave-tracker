@@ -1700,7 +1700,8 @@ function renderWebinarLeadsSection(e){
 function renderWebinarPerfDetail(e){
   const region = webinarRegion(e.market);
   const backBtn = `<button class="btn ghost small" data-action="webinar-perf-back" style="margin-bottom:14px;">← Back to library</button>
-  ${editMode ? `<button class="btn small" data-action="webinar-perf-edit" style="margin-bottom:14px;margin-left:8px;">✏️ ${e.perfId?'Edit':'Add'} report</button>` : ''}`;
+  ${editMode ? `<button class="btn small" data-action="webinar-perf-edit" style="margin-bottom:14px;margin-left:8px;">✏️ ${e.perfId?'Edit':'Add'} report</button>` : ''}
+  ${editMode && e.perfId ? `<button class="btn ghost small" data-action="webinar-perf-delete" data-id="${e.perfId}" style="margin-bottom:14px;margin-left:8px;color:var(--attack);">🗑️ Delete report</button>` : ''}`;
 
   const insightLines = (e.keyInsights||'').split('\n').filter(Boolean);
 
@@ -1911,7 +1912,8 @@ const EXEC_STATUS_OPTIONS = ['Not started','In Progress','Done','Blocked'];
 function renderWebinarExecutionDetail(e){
   const region = webinarRegion(e.market);
   const backBtn = `<button class="btn ghost small" data-action="webinar-exec-back" style="margin-bottom:14px;">← Back to library</button>
-  ${editMode ? `<button class="btn small" data-action="webinar-exec-edit" style="margin-bottom:14px;margin-left:8px;">✏️ Edit checklist</button>` : ''}`;
+  ${editMode ? `<button class="btn small" data-action="webinar-exec-edit" style="margin-bottom:14px;margin-left:8px;">✏️ Edit checklist</button>` : ''}
+  ${editMode && e.execId ? `<button class="btn ghost small" data-action="webinar-exec-delete" data-id="${e.execId}" style="margin-bottom:14px;margin-left:8px;color:var(--attack);">🗑️ Delete checklist</button>` : ''}`;
 
   const stepRows = EXECUTION_STEPS.map(s=>{
     const owner = execStepVal(e, s.key, 'owner', s.defaultOwner);
@@ -2554,7 +2556,8 @@ function renderCopyCards(shown, comments, fields){
 
 function renderWebinarCopyDetail(e){
   const boxes = splitTouchpoints(e.copyText);
-  const backBtn = `<button class="btn ghost small" data-action="webinar-copy-back" style="margin-bottom:14px;">← Back to copies</button>`;
+  const backBtn = `<button class="btn ghost small" data-action="webinar-copy-back" style="margin-bottom:14px;">← Back to copies</button>
+  ${editMode ? `<button class="btn ghost small" data-action="webinar-copy-delete" data-id="${e.id}" style="margin-bottom:14px;margin-left:8px;color:var(--attack);">🗑️ Delete copy</button>` : ''}`;
   const bits = [];
   if(e.date) bits.push('📅 ' + esc(formatDateDisplay(e.date) || e.date));
   if(e.bannerLink) bits.push(renderCellValue(e.bannerLink, true, false));
@@ -2921,7 +2924,10 @@ async function render(){
     html += regionManageModal();
   }
   app.innerHTML = html;
-  document.getElementById('sidebar').innerHTML = renderSidebar();
+  const sidebarEl = document.getElementById('sidebar');
+  const showingWelcome = !state.quarter && !editMode && !state.welcomed && meta.quarters.length;
+  sidebarEl.style.display = showingWelcome ? 'none' : '';
+  sidebarEl.innerHTML = showingWelcome ? '' : renderSidebar();
   bindEvents();
   hydrateLinkPreviews();
 }
@@ -3033,6 +3039,39 @@ function bindEvents(){
 
   const webinarCopyBackBtn = app.querySelector('[data-action="webinar-copy-back"]');
   if(webinarCopyBackBtn) webinarCopyBackBtn.addEventListener('click', ()=>{ state.webinarCopyId=null; render(); });
+
+  const webinarPerfDeleteBtn = app.querySelector('[data-action="webinar-perf-delete"]');
+  if(webinarPerfDeleteBtn) webinarPerfDeleteBtn.addEventListener('click', async ()=>{
+    const ok = await customConfirm("Delete this performance report? This won't remove the webinar from the calendar.");
+    if(!ok) return;
+    const data = await loadQData(state.quarter);
+    data.entries = data.entries.filter(x=>x.id!==webinarPerfDeleteBtn.dataset.id);
+    await saveQData(state.quarter);
+    state.webinarPerfId = null;
+    render();
+  });
+
+  const webinarExecDeleteBtn = app.querySelector('[data-action="webinar-exec-delete"]');
+  if(webinarExecDeleteBtn) webinarExecDeleteBtn.addEventListener('click', async ()=>{
+    const ok = await customConfirm("Delete this execution checklist? This won't remove the webinar from the calendar.");
+    if(!ok) return;
+    const data = await loadQData(state.quarter);
+    data.entries = data.entries.filter(x=>x.id!==webinarExecDeleteBtn.dataset.id);
+    await saveQData(state.quarter);
+    state.webinarExecId = null;
+    render();
+  });
+
+  const webinarCopyDeleteBtn = app.querySelector('[data-action="webinar-copy-delete"]');
+  if(webinarCopyDeleteBtn) webinarCopyDeleteBtn.addEventListener('click', async ()=>{
+    const ok = await customConfirm("Delete this webinar copy?");
+    if(!ok) return;
+    const data = await loadQData(state.quarter);
+    data.entries = data.entries.filter(x=>x.id!==webinarCopyDeleteBtn.dataset.id);
+    await saveQData(state.quarter);
+    state.webinarCopyId = null;
+    render();
+  });
 
   const editBtn = app.querySelector('[data-action="toggle-edit"]');
   if(editBtn) editBtn.addEventListener('click', toggleEdit);
