@@ -564,7 +564,15 @@ async function seedQuarter(quarterName, seedArray, importedFlagKey){
       const parsed = JSON.parse(r2.value);
       existingEntries = parsed.entries || [];
     }
-  }catch(e){ /* nothing persisted yet - fine */ }
+  }catch(e){
+    // Couldn't confirm what's actually on the server (network blip, etc.) -
+    // bail out rather than treat this like a genuinely empty quarter. Every
+    // real entry the team has saved would otherwise get run through the
+    // "seed anything missing" logic below and saveQData() would overwrite
+    // the server's real data with just the handful of seed rows. Safe to
+    // skip silently - this same seeding runs again on the next page load.
+    return;
+  }
 
   // Always merge in any seed rows not already present (matched by a
   // content-based key, not a one-time flag) so new data added later keeps
@@ -3329,6 +3337,14 @@ function bindEvents(){
       data.entries[idx] = {...data.entries[idx], ...vals, updatedAt:Date.now()};
     } else {
       data.entries.push({id:uid(), channel:state.channel, kind:state.section, group:state.group, country:state.country, ...vals, updatedAt:Date.now(), createdAt:Date.now()});
+      // Leftover filters from earlier browsing (search text, a week, or a
+      // webinar region tab) can hide the entry that was just added - it
+      // saves fine but the list shows "no entries yet", which reads as a
+      // failed save. Clear them so the new entry is visible immediately.
+      state.search = '';
+      state.weekFilter = 'all';
+      state.webinarRegion = 'all';
+      state.webinarCopiesRegion = 'all';
     }
     await saveQData(state.quarter);
     state.modal = null;
