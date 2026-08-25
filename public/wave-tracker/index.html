@@ -935,6 +935,18 @@ function seedDedupeKey(e){
   if(e.kind==='copies'){
     return ['copy',e.channel,canonCountry(e.country),e.name,e.date||'',e.mirrorOf||''].join('|');
   }
+  if(e.kind==='insights'){
+    // Insights are a weekly log - a country legitimately holds one row per
+    // week, so the week and headline are what make a row its own row. Falling
+    // through to the generic key below (channel+country only) made every week
+    // collapse onto a single slot, so the dedupe sweep deleted all but one.
+    return ['ins',e.channel,canonCountry(e.country),e.date||'',String(e.title||'').trim()].join('|');
+  }
+  if(e.kind==='execution'){
+    // Execution rows are one per webinar and carry market/topic/date (never
+    // `country`) - key them exactly like the webinar calendar rows they track.
+    return ['exec',e.channel,canonCountry(e.market),e.topic||'',e.date||''].join('|');
+  }
   // A country can hold one Email Base row per section (its country-wide
   // rollup) plus any number of drip-level detail rows. The rollup row has no
   // `drip` value, so it keeps one stable slot per country/section. Detail
