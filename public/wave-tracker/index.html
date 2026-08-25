@@ -239,16 +239,29 @@ window.storage = window.storage || {
   async get(key){
     const r = await fetch('/api/kv/' + encodeURIComponent(key));
     if(!r.ok) throw new Error('storage get failed: ' + r.status);
-    return await r.json(); // { value: string | null }
+    return await r.json(); // { value: string | null, version: string | null }
   },
-  async set(key, value){
+  // `version` is the token handed back by get(). Passing it makes the write
+  // conditional: if someone else has saved since, the server refuses with 409
+  // and returns their copy, which the caller merges into rather than
+  // steamrolling (see saveQData). Omit it for an unconditional write.
+  async set(key, value, shared, version){
+    const payload = { value };
+    if(version !== undefined) payload.version = version;
     const r = await fetch('/api/kv/' + encodeURIComponent(key), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value })
+      body: JSON.stringify(payload)
     });
+    if(r.status === 409){
+      const current = await r.json().catch(()=>({}));
+      const err = new Error('storage set conflict');
+      err.conflict = true;
+      err.current = current;
+      throw err;
+    }
     if(!r.ok) throw new Error('storage set failed: ' + r.status);
-    return true;
+    return await r.json().catch(()=>({ success:true }));
   },
   async delete(key){
     await fetch('/api/kv/' + encodeURIComponent(key), { method: 'DELETE' });
@@ -564,6 +577,11 @@ async function seedQuarter(quarterName, seedArray, importedFlagKey){
       const parsed = JSON.parse(r2.value);
       existingEntries = parsed.entries || [];
     }
+    // Baseline for the conditional save below: what the server held right now,
+    // before any seeding. Rows the seed adds then count as our own additions
+    // and survive a merge instead of being mistaken for someone else's.
+    qdataVersion[quarterName] = r2 ? r2.version : undefined;
+    qdataBase[quarterName] = entrySnapshot(existingEntries);
   }catch(e){
     // Couldn't confirm what's actually on the server (network blip, etc.) -
     // bail out rather than treat this like a genuinely empty quarter. Every
@@ -738,7 +756,9 @@ async function loadAll(){
   try{
     const r = await window.storage.get('meta', true);
     if(r && r.value) meta = mergeMetaWithDefaults(JSON.parse(r.value));
+    metaVersion = r ? r.version : undefined;
   }catch(e){ /* using defaults */ }
+  metaBase = metaSnapshot(meta);
 
   // Self-healing: the "already imported" flag in meta is only trustworthy if
   // there's actually data behind it. If storage never actually saved the
@@ -766,43 +786,185 @@ async function loadAll(){
   saveMeta().catch(()=>{});
 }
 async function sleepMs(ms){ return new Promise(r=>setTimeout(r,ms)); }
-async function storageSetWithRetry(key, value, shared, attempts=3){
-  let lastErr;
-  for(let i=0;i<attempts;i++){
+// A save that never lands used to fail silently: the entry stayed on screen
+// because it was already in the in-memory cache, so it looked saved right up
+// until the next refresh, when it was simply gone. Say so instead.
+let saveFailedToastTimer = null;
+function notifySaveFailed(what){
+  let el = document.getElementById('save-failed-toast');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'save-failed-toast';
+    el.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:9999;'
+      + 'background:#B42318;color:#fff;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:600;'
+      + 'box-shadow:0 10px 30px rgba(0,0,0,.25);max-width:90vw;text-align:center;';
+    document.body.appendChild(el);
+  }
+  el.textContent = '⚠️ Could not save your ' + what + ' — check your connection and try again. Do not close this tab.';
+  el.style.display = '';
+  if(saveFailedToastTimer) clearTimeout(saveFailedToastTimer);
+  saveFailedToastTimer = setTimeout(()=>{ el.style.display = 'none'; }, 10000);
+}
+// --- shared-blob concurrency ------------------------------------------------
+// Every quarter is one blob shared by the whole team, and a save writes the
+// whole thing. Two people with the page open therefore each held a snapshot
+// from whenever they loaded, and whoever saved second wrote their stale copy
+// over the top - silently deleting everything the other had added in between.
+// Both saves returned 200, so nothing showed up in the network tab.
+//
+// So each blob now tracks the version it was loaded at, plus a baseline of
+// what the server had at that moment. A save is conditional on that version;
+// if it clashes, we replay only our own changes (adds / edits / deletes,
+// worked out against the baseline) on top of their copy and write again.
+const qdataVersion = {};   // quarter -> version token the cache was loaded at
+const qdataBase = {};      // quarter -> Map(entry id -> JSON at load time)
+const commentsVersion = {};
+let metaVersion;
+let metaBase;              // top-level meta keys as JSON, at load time
+
+function metaSnapshot(m){
+  const snap = {};
+  for(const k of Object.keys(m || {})) snap[k] = JSON.stringify(m[k]);
+  return snap;
+}
+
+function entrySnapshot(entries){
+  const m = new Map();
+  for(const e of (entries||[])){ if(e && e.id) m.set(e.id, JSON.stringify(e)); }
+  return m;
+}
+
+// Replay our local changes onto the copy that's now on the server. Anything we
+// never touched keeps THEIR version, so their concurrent work survives too.
+function mergeEntries(base, mine, theirs){
+  const out = new Map();
+  for(const e of (theirs||[])){ if(e && e.id) out.set(e.id, e); }
+  const mineIds = new Set();
+  for(const e of (mine||[])){
+    if(!e || !e.id) continue;
+    mineIds.add(e.id);
+    const wasAtLoad = base.get(e.id);
+    // Added by us, or edited by us since load - our copy wins.
+    if(wasAtLoad === undefined || wasAtLoad !== JSON.stringify(e)) out.set(e.id, e);
+  }
+  // Deleted by us since load - drop it from theirs as well.
+  for(const id of base.keys()){ if(!mineIds.has(id)) out.delete(id); }
+  return [...out.values()];
+}
+
+function parseEntries(value){
+  try{ const p = JSON.parse(value || '{"entries":[]}'); return Array.isArray(p.entries) ? p.entries : []; }
+  catch(e){ return []; }
+}
+
+async function saveMeta(){
+  for(let i=0;i<4;i++){
     try{
-      await window.storage.set(key, value, shared);
+      const res = await window.storage.set('meta', JSON.stringify(meta), true, metaVersion);
+      metaVersion = res && res.version;
+      metaBase = metaSnapshot(meta);
       return true;
-    }catch(e){
-      lastErr = e;
-      if(i < attempts-1) await sleepMs(400 * (i+1)); // brief backoff before retrying
+    }catch(err){
+      if(err && err.conflict){
+        // meta is small config (quarter list, stage groups, passcode). Rebase
+        // onto theirs, carrying over only the keys we actually changed since
+        // load - so their new quarter/stage isn't undone by our unrelated edit.
+        let theirs = {};
+        try{ theirs = JSON.parse((err.current && err.current.value) || '{}'); }catch(e){ theirs = {}; }
+        const rebased = {...theirs};
+        for(const k of Object.keys(meta)){
+          const atLoad = metaBase ? metaBase[k] : undefined;
+          if(atLoad === undefined || atLoad !== JSON.stringify(meta[k])) rebased[k] = meta[k];
+        }
+        meta = mergeMetaWithDefaults(rebased);
+        metaBase = metaSnapshot(meta);
+        metaVersion = err.current && err.current.version;
+        continue;
+      }
+      if(i < 3){ await sleepMs(400 * (i+1)); continue; }
+      notifySaveFailed('settings');
+      return false;
     }
   }
+  notifySaveFailed('settings');
   return false;
-}
-async function saveMeta(){
-  await storageSetWithRetry('meta', JSON.stringify(meta), true);
 }
 async function loadQData(q){
   if(qdataCache[q]) return qdataCache[q];
   try{
     const r = await window.storage.get('qdata:'+q, true);
     qdataCache[q] = (r && r.value) ? JSON.parse(r.value) : {entries:[]};
-  }catch(e){ qdataCache[q] = {entries:[]}; }
+    qdataVersion[q] = r ? r.version : undefined;
+    qdataBase[q] = entrySnapshot(qdataCache[q].entries);
+  }catch(e){
+    qdataCache[q] = {entries:[]};
+    qdataVersion[q] = undefined;
+    qdataBase[q] = new Map();
+  }
   return qdataCache[q];
 }
 async function saveQData(q){
-  await storageSetWithRetry('qdata:'+q, JSON.stringify(qdataCache[q]), true);
+  for(let i=0;i<5;i++){
+    try{
+      const res = await window.storage.set('qdata:'+q, JSON.stringify(qdataCache[q]), true, qdataVersion[q]);
+      qdataVersion[q] = res && res.version;
+      qdataBase[q] = entrySnapshot(qdataCache[q].entries);
+      return true;
+    }catch(err){
+      if(err && err.conflict){
+        const theirs = parseEntries(err.current && err.current.value);
+        qdataCache[q].entries = mergeEntries(qdataBase[q] || new Map(), qdataCache[q].entries, theirs);
+        qdataBase[q] = entrySnapshot(theirs);
+        qdataVersion[q] = err.current && err.current.version;
+        continue; // write again, now on top of their copy
+      }
+      if(i < 4){ await sleepMs(400 * (i+1)); continue; }
+      notifySaveFailed('entries');
+      return false;
+    }
+  }
+  notifySaveFailed('entries');
+  return false;
 }
 async function loadComments(q){
   if(commentsCache[q]) return commentsCache[q];
   try{
     const r = await window.storage.get('comments:'+q, true);
     commentsCache[q] = (r && r.value) ? JSON.parse(r.value) : {};
-  }catch(e){ commentsCache[q] = {}; }
+    commentsVersion[q] = r ? r.version : undefined;
+  }catch(e){ commentsCache[q] = {}; commentsVersion[q] = undefined; }
   return commentsCache[q];
 }
 async function saveComments(q){
-  await storageSetWithRetry('comments:'+q, JSON.stringify(commentsCache[q]), true);
+  for(let i=0;i<4;i++){
+    try{
+      const res = await window.storage.set('comments:'+q, JSON.stringify(commentsCache[q]), true, commentsVersion[q]);
+      commentsVersion[q] = res && res.version;
+      return true;
+    }catch(err){
+      if(err && err.conflict){
+        // Comments are append-only per entry, so a union keyed on
+        // author+timestamp+text keeps both sides' threads intact.
+        let theirs = {};
+        try{ theirs = JSON.parse((err.current && err.current.value) || '{}'); }catch(e){ theirs = {}; }
+        const merged = {...theirs};
+        for(const id of Object.keys(commentsCache[q] || {})){
+          const seen = new Set((merged[id]||[]).map(c=>c.author+'|'+c.ts+'|'+c.text));
+          merged[id] = (merged[id]||[]).concat(
+            (commentsCache[q][id]||[]).filter(c=>!seen.has(c.author+'|'+c.ts+'|'+c.text))
+          ).sort((a,b)=>(a.ts||0)-(b.ts||0));
+        }
+        commentsCache[q] = merged;
+        commentsVersion[q] = err.current && err.current.version;
+        continue;
+      }
+      if(i < 3){ await sleepMs(400 * (i+1)); continue; }
+      notifySaveFailed('comments');
+      return false;
+    }
+  }
+  notifySaveFailed('comments');
+  return false;
 }
 function uid(){ return 'e'+Date.now()+Math.random().toString(36).slice(2,7); }
 function esc(s){ return (s===undefined||s===null)?'':String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
