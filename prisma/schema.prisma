@@ -7,10 +7,12 @@ generator client {
   binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x"]
 }
 
+// Any Postgres host works — nothing below is provider-specific. See .env.example
+// for the pooled/direct pair on Neon and Supabase.
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL") // pooled connection (Supabase Supavisor :6543) used at runtime
-  directUrl = env("DIRECT_URL")   // direct connection (:5432) used for migrations / db push
+  url       = env("DATABASE_URL") // POOLED connection, used at runtime
+  directUrl = env("DIRECT_URL")   // DIRECT (unpooled) connection, used only for migrations / db push
 }
 
 // Generic key -> JSON blob store backing the Wave Tracker frontend's

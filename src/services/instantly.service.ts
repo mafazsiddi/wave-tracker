@@ -19,6 +19,11 @@ export class InstantlyError extends Error {
 }
 
 async function inst<T>(path: string, init: RequestInit = {}): Promise<T> {
+  // See the matching guard in hubspot.service.ts — an empty key would otherwise
+  // surface as a 401 that looks like a credential problem rather than a missing one.
+  if (!env.INSTANTLY_API_KEY) {
+    throw new InstantlyError(0, 'INSTANTLY_API_KEY is not set — Instantly integration is not configured.');
+  }
   const res = await fetch(BASE + path, {
     ...init,
     headers: {

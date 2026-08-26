@@ -1,7 +1,10 @@
 node_modules
 
-# Keep environment variables out of version control
-.env
+# Keep environment variables out of version control.
+# Glob rather than the bare name so .env.local, .env.production and ad-hoc
+# backups like .env.backup-* can't slip in as untracked-but-committable files.
+.env*
+!.env.example
 
 # Prisma generated client
 /src/generated/prisma

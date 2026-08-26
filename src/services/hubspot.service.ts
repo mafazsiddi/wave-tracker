@@ -24,6 +24,12 @@ export class HubSpotError extends Error {
 }
 
 async function hs<T>(path: string, init: RequestInit = {}): Promise<T> {
+  // Fail before the network call. Without this an unset token goes out as
+  // `Bearer ` and HubSpot answers 401, which is indistinguishable from a
+  // revoked or wrongly-scoped token.
+  if (!env.HUBSPOT_ACCESS_TOKEN) {
+    throw new HubSpotError(0, 'HUBSPOT_ACCESS_TOKEN is not set — HubSpot integration is not configured.');
+  }
   const res = await fetch(BASE + path, {
     ...init,
     headers: {
