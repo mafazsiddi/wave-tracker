@@ -729,6 +729,13 @@ async function seedQuarter(quarterName, seedArray, importedFlagKey){
     const deduped = [];
     for(const e of existingEntries){
       const k = seedDedupeKey(e);
+      // Only ever collapse rows that exist in the seed. A row someone typed in
+      // has no seed counterpart, and two of them sharing a key is legitimate -
+      // an Insights row is keyed on week + headline, both optional, so two
+      // entries for the same week (or two with those fields left blank) looked
+      // like duplicates and the sparser one was silently deleted. Whatever the
+      // team enters is theirs; this sweep no longer gets a vote on it.
+      if(!seedByKey.has(k)){ deduped.push(e); continue; }
       const prev = byKey.get(k);
       if(!prev){ byKey.set(k, e); deduped.push(e); continue; }
       const score = (x)=> Object.values(x).filter(v => String(v ?? '').trim()).length;
