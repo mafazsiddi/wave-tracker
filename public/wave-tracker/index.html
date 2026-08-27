@@ -2356,8 +2356,45 @@ function stageGroupTabs(){
   ).join('')}${addForm}</div>${restoreRow}`;
 }
 
+// Countries that actually hold rows in a stage, on top of the ones its country
+// list names.
+//
+// Navigation is channel > section > stage > country, so the country list is the
+// only way to reach an entry. A row filed under a country the stage never
+// listed - Global, EU, Misc., "KSA, UAE", Unmapped (Instantly) - had no tab
+// leading to it: saved, counted in the totals, and invisible on screen, which
+// reads as data loss. Seeding tries to re-file such rows, but only when the
+// country belongs to some other stage; these belong to none, so they sat
+// stranded. Deriving the tabs from the data as well as the config means a
+// stored row always has a path to it.
+//
+// Countries an editor deleted stay deleted: del-country records them in
+// meta.removedCountries, and this must not resurrect them.
+function navigableCountries(group){
+  const configured = meta.stageGroups[group] || [];
+  const removed = new Set(
+    meta.removedCountries && Array.isArray(meta.removedCountries[group])
+      ? meta.removedCountries[group]
+      : []
+  );
+  const known = new Set(configured);
+  const extra = [];
+  const data = qdataCache[state.quarter];
+  if(data && Array.isArray(data.entries)){
+    for(const e of data.entries){
+      if(!e || e.group !== group) continue;
+      const c = e.country;
+      if(!c || known.has(c) || removed.has(c)) continue;
+      known.add(c);
+      extra.push(c);
+    }
+    extra.sort();
+  }
+  return [...configured, ...extra];
+}
+
 function countryTabs(){
-  const countries = meta.stageGroups[state.group] || [];
+  const countries = navigableCountries(state.group);
   let addForm = editMode ? `<span class="add-country-form">
       <input type="text" placeholder="+ country" data-role="new-country">
       <button class="btn small" data-action="add-country">Add</button>
