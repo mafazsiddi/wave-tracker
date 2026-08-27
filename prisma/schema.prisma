@@ -24,3 +24,22 @@ model KVStore {
   updatedAt DateTime @updatedAt
   createdAt DateTime @default(now())
 }
+
+// Previous versions of each KVStore key, written before every change.
+//
+// The whole quarter lives in one blob, so a client-side bug can rewrite the
+// lot - which is exactly how a batch of hand-entered rows was lost. Guards stop
+// the obvious cases, but nothing stops all of them, so keep history: any loss
+// becomes "restore the copy from before it happened" instead of retyping.
+//
+// `entries` is the row count of the blob at that moment, denormalised so the
+// history list can be rendered without parsing every stored value.
+model KVRevision {
+  id        Int      @id @default(autoincrement())
+  key       String
+  value     String
+  entries   Int?
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+}

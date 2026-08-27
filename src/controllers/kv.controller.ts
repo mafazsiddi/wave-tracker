@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
 import prisma from '../config/database';
+import { env } from '../config/env';
+import { safeEqual } from '../utils/pin';
 
 /**
  * Key-value store backing the Wave Tracker frontend's window.storage.
@@ -43,6 +45,36 @@ const currentOf = async (key: string) => {
   };
 };
 
+// How many past versions of a key to keep. Each one is a full copy of the
+// blob, so this trades storage for how far back a restore can reach.
+const MAX_REVISIONS = 40;
+
+/**
+ * Snapshot the value a key held *before* it is overwritten, then trim history.
+ *
+ * Never allowed to break the write it accompanies: history is a safety net, and
+ * a net that takes the dashboard down when it tears is worse than no net. Any
+ * failure here is logged and swallowed.
+ */
+const recordRevision = async (key: string, previousValue: string): Promise<void> => {
+  try {
+    await prisma.kVRevision.create({
+      data: { key, value: previousValue, entries: entryCount(previousValue) },
+    });
+    const stale = await prisma.kVRevision.findMany({
+      where: { key },
+      orderBy: { createdAt: 'desc' },
+      skip: MAX_REVISIONS,
+      select: { id: true },
+    });
+    if (stale.length) {
+      await prisma.kVRevision.deleteMany({ where: { id: { in: stale.map((r) => r.id) } } });
+    }
+  } catch (error: any) {
+    console.error(`[kv] could not record revision for "${key}": ${error.message}`);
+  }
+};
+
 // Number of rows in an `{entries:[...]}` blob, or null if this value isn't one.
 const entryCount = (value: string): number | null => {
   try {
@@ -75,15 +107,14 @@ const GUARD_KEEP_RATIO = 0.5;
  * merges its own state into the server's copy and writes back. A genuine bulk
  * delete by a person is still possible, via `allowShrink: true`.
  */
-const wouldDestroyData = async (
-  key: string,
+const wouldDestroyData = (
+  row: { value: string } | null,
   value: string,
   body: any
-): Promise<{ existing: number; incoming: number } | null> => {
+): { existing: number; incoming: number } | null => {
   if (body?.allowShrink === true) return null;
   const incoming = entryCount(value);
   if (incoming === null) return null;
-  const row = await prisma.kVStore.findUnique({ where: { key } });
   if (!row) return null;
   const existing = entryCount(row.value);
   if (existing === null || existing < GUARD_MIN_ROWS) return null;
@@ -103,7 +134,10 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
     const value = String(req.body?.value ?? '');
     const body = req.body ?? {};
 
-    const destructive = await wouldDestroyData(key, value, body);
+    // One read serves both the guard and the history snapshot below.
+    const existingRow = await prisma.kVStore.findUnique({ where: { key } });
+
+    const destructive = wouldDestroyData(existingRow, value, body);
     if (destructive) {
       console.warn(
         `[kv] refused write to "${key}": would drop ${destructive.existing} entries to ${destructive.incoming}`
@@ -118,12 +152,21 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Keep the outgoing value, but only once the write has actually landed and
+    // only when something changed - re-saving an identical blob is not history.
+    const snapshotPrevious = async (): Promise<void> => {
+      if (existingRow && existingRow.value !== value) {
+        await recordRevision(key, existingRow.value);
+      }
+    };
+
     if (!('version' in body)) {
       await prisma.kVStore.upsert({
         where: { key },
         update: { value },
         create: { key, value },
       });
+      await snapshotPrevious();
       res.json({ success: true, version: versionOf(value) });
       return;
     }
@@ -153,6 +196,7 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       res.status(409).json({ success: false, conflict: true, ...(await currentOf(key)) });
       return;
     }
+    await snapshotPrevious();
     res.json({ success: true, version: versionOf(value) });
   } catch (error: any) {
     res.status(400).json({ success: false, error: error.message });
@@ -163,8 +207,110 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
 export const deleteKV = async (req: Request, res: Response): Promise<void> => {
   try {
     const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
+    const existing = await prisma.kVStore.findUnique({ where: { key } });
+    if (existing) await recordRevision(key, existing.value);
     await prisma.kVStore.deleteMany({ where: { key } });
     res.json({ success: true });
+  } catch (error: any) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+};
+
+// GET /api/kv/:key/revisions -> { revisions: [{ id, createdAt, entries }] }
+// Values are omitted: the list exists to pick from, and each one is a full copy
+// of the quarter, so returning them all would be a multi-megabyte response.
+export const listRevisions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
+    const revisions = await prisma.kVRevision.findMany({
+      where: { key },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, createdAt: true, entries: true },
+    });
+    const current = await prisma.kVStore.findUnique({ where: { key } });
+    res.json({
+      key,
+      current: current ? { entries: entryCount(current.value), updatedAt: current.updatedAt } : null,
+      revisions,
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// GET /api/kv/:key/revisions/:id -> { id, createdAt, entries, value }
+export const getRevision = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ success: false, error: 'bad revision id' });
+      return;
+    }
+    const revision = await prisma.kVRevision.findFirst({ where: { id, key } });
+    if (!revision) {
+      res.status(404).json({ success: false, error: 'no such revision for this key' });
+      return;
+    }
+    res.json(revision);
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * POST /api/kv/:key/revisions/:id/restore  body { pin }  ->  { success, version, entries }
+ *
+ * Requires the edit PIN. Restoring is the one operation here that deliberately
+ * overwrites current data with older data, so it bypasses the mass-deletion
+ * guard - which means it must not be callable by anyone who finds the URL.
+ *
+ * The state being replaced is itself snapshotted first, so restoring to the
+ * wrong point is undoable rather than a second loss.
+ */
+export const restoreRevision = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const pin = typeof req.body?.pin === 'string' ? req.body.pin : '';
+    if (!safeEqual(pin, env.EDIT_PIN)) {
+      res.status(403).json({ success: false, error: 'wrong or missing edit PIN' });
+      return;
+    }
+
+    const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ success: false, error: 'bad revision id' });
+      return;
+    }
+
+    const revision = await prisma.kVRevision.findFirst({ where: { id, key } });
+    if (!revision) {
+      res.status(404).json({ success: false, error: 'no such revision for this key' });
+      return;
+    }
+
+    const existing = await prisma.kVStore.findUnique({ where: { key } });
+    if (existing && existing.value !== revision.value) {
+      await recordRevision(key, existing.value);
+    }
+
+    await prisma.kVStore.upsert({
+      where: { key },
+      update: { value: revision.value },
+      create: { key, value: revision.value },
+    });
+
+    console.warn(
+      `[kv] restored "${key}" to revision ${id} from ${revision.createdAt.toISOString()} ` +
+        `(${entryCount(existing?.value ?? '') ?? '?'} -> ${revision.entries ?? '?'} entries)`
+    );
+
+    res.json({
+      success: true,
+      version: versionOf(revision.value),
+      entries: revision.entries,
+      restoredFrom: revision.createdAt,
+    });
   } catch (error: any) {
     res.status(400).json({ success: false, error: error.message });
   }

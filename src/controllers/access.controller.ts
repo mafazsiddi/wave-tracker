@@ -1,14 +1,6 @@
 import { Request, Response } from 'express';
-import crypto from 'crypto';
 import { env } from '../config/env';
-
-/** Constant-time string compare so the PIN can't be guessed via response timing. */
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
-}
+import { safeEqual } from '../utils/pin';
 
 /**
  * POST /api/access/verify  body { pin }  ->  { ok: boolean }
