@@ -244,10 +244,19 @@ window.storage = window.storage || {
   // `version` is the token handed back by get(). Passing it makes the write
   // conditional: if someone else has saved since, the server refuses with 409
   // and returns their copy, which the caller merges into rather than
-  // steamrolling (see saveQData). Omit it for an unconditional write.
+  // steamrolling (see saveQData).
+  //
+  // A version is ALWAYS sent, even when we don't have one. Leaving the field
+  // off tells the server to write unconditionally, and the single situation
+  // where we have no version is the one where that is most destructive: a
+  // failed get() leaves the cache looking like an empty quarter, so the next
+  // save replaced the team's entire dataset with that empty view. Seeding then
+  // refilled the seed rows on the following load, so the tracker looked normal
+  // while every manually added row was gone. `null` means "only if this key
+  // does not exist yet", so an existing key comes back 409 and the caller
+  // merges into the server's copy instead of erasing it.
   async set(key, value, shared, version){
-    const payload = { value };
-    if(version !== undefined) payload.version = version;
+    const payload = { value, version: version === undefined ? null : version };
     const r = await fetch('/api/kv/' + encodeURIComponent(key), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
