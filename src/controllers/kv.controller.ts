@@ -50,6 +50,45 @@ const currentOf = async (key: string) => {
 const MAX_REVISIONS = 40;
 
 /**
+ * Create the revision table if it isn't there, once per process.
+ *
+ * This project has no migrations directory - the schema is applied with
+ * `prisma db push`, run by hand against whichever database the operator is
+ * pointed at. That left production without KVRevision while history looked
+ * fine locally: every write silently failed to record, and the gap only
+ * surfaced when data went missing and there was nothing to restore from.
+ *
+ * Rather than depend on someone remembering to run a command against the right
+ * database, the table asserts itself. Strictly additive - CREATE TABLE IF NOT
+ * EXISTS touches nothing else - so it is safe against a database shared with
+ * another application.
+ */
+let revisionTableReady: Promise<void> | null = null;
+const ensureRevisionTable = (): Promise<void> => {
+  if (!revisionTableReady) {
+    revisionTableReady = (async () => {
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS "KVRevision" (
+          "id"        SERIAL PRIMARY KEY,
+          "key"       TEXT NOT NULL,
+          "value"     TEXT NOT NULL,
+          "entries"   INTEGER,
+          "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await prisma.$executeRawUnsafe(
+        `CREATE INDEX IF NOT EXISTS "KVRevision_key_createdAt_idx" ON "KVRevision"("key", "createdAt")`
+      );
+    })().catch((error: any) => {
+      // Let the next call try again rather than caching the failure forever.
+      revisionTableReady = null;
+      console.error(`[kv] could not ensure KVRevision table: ${error.message}`);
+    });
+  }
+  return revisionTableReady;
+};
+
+/**
  * Snapshot the value a key held *before* it is overwritten, then trim history.
  *
  * Never allowed to break the write it accompanies: history is a safety net, and
@@ -58,6 +97,7 @@ const MAX_REVISIONS = 40;
  */
 const recordRevision = async (key: string, previousValue: string): Promise<void> => {
   try {
+    await ensureRevisionTable();
     await prisma.kVRevision.create({
       data: { key, value: previousValue, entries: entryCount(previousValue) },
     });
@@ -221,6 +261,7 @@ export const deleteKV = async (req: Request, res: Response): Promise<void> => {
 // of the quarter, so returning them all would be a multi-megabyte response.
 export const listRevisions = async (req: Request, res: Response): Promise<void> => {
   try {
+    await ensureRevisionTable();
     const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
     const revisions = await prisma.kVRevision.findMany({
       where: { key },
@@ -241,6 +282,7 @@ export const listRevisions = async (req: Request, res: Response): Promise<void> 
 // GET /api/kv/:key/revisions/:id -> { id, createdAt, entries, value }
 export const getRevision = async (req: Request, res: Response): Promise<void> => {
   try {
+    await ensureRevisionTable();
     const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
@@ -270,6 +312,7 @@ export const getRevision = async (req: Request, res: Response): Promise<void> =>
  */
 export const restoreRevision = async (req: Request, res: Response): Promise<void> => {
   try {
+    await ensureRevisionTable();
     const pin = typeof req.body?.pin === 'string' ? req.body.pin : '';
     if (!safeEqual(pin, env.EDIT_PIN)) {
       res.status(403).json({ success: false, error: 'wrong or missing edit PIN' });
