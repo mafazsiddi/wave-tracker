@@ -43,16 +43,80 @@ const currentOf = async (key: string) => {
   };
 };
 
+// Number of rows in an `{entries:[...]}` blob, or null if this value isn't one.
+const entryCount = (value: string): number | null => {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed?.entries) ? parsed.entries.length : null;
+  } catch {
+    return null;
+  }
+};
+
+// Below this, a key is too small for "most of it vanished" to mean anything.
+const GUARD_MIN_ROWS = 20;
+// A write keeping less than this share of the existing rows is refused.
+const GUARD_KEEP_RATIO = 0.5;
+
+/**
+ * Refuse writes that would destroy most of a quarter's entries.
+ *
+ * The client sends the whole dataset on every save, so any bug that makes it
+ * believe the quarter is empty - a failed GET, a bad merge, a sweep gone wrong
+ * - turns the next save into a full erase. Two such bugs have already been
+ * found and fixed in the frontend; this exists so a third one cannot destroy
+ * data while it goes unnoticed.
+ *
+ * Deliberately server-side: it holds no matter what the page does, including
+ * versions of the page still cached in someone's browser.
+ *
+ * Answers exactly like a version conflict (409 + the current value) rather
+ * than a hard error, because the client already knows how to handle that: it
+ * merges its own state into the server's copy and writes back. A genuine bulk
+ * delete by a person is still possible, via `allowShrink: true`.
+ */
+const wouldDestroyData = async (
+  key: string,
+  value: string,
+  body: any
+): Promise<{ existing: number; incoming: number } | null> => {
+  if (body?.allowShrink === true) return null;
+  const incoming = entryCount(value);
+  if (incoming === null) return null;
+  const row = await prisma.kVStore.findUnique({ where: { key } });
+  if (!row) return null;
+  const existing = entryCount(row.value);
+  if (existing === null || existing < GUARD_MIN_ROWS) return null;
+  if (incoming >= Math.floor(existing * GUARD_KEEP_RATIO)) return null;
+  return { existing, incoming };
+};
+
 // PUT /api/kv/:key
 //   body { value }                  -> unconditional write (legacy callers)
 //   body { value, version: string } -> only overwrites that exact version
 //   body { value, version: null }   -> only creates a key that doesn't exist yet
+//   body { ..., allowShrink: true } -> opts out of the mass-deletion guard
 // 200 { success: true, version } on success, 409 { conflict: true, value, version } on a clash.
 export const putKV = async (req: Request, res: Response): Promise<void> => {
   try {
     const key = Array.isArray(req.params.key) ? req.params.key[0] : req.params.key;
     const value = String(req.body?.value ?? '');
     const body = req.body ?? {};
+
+    const destructive = await wouldDestroyData(key, value, body);
+    if (destructive) {
+      console.warn(
+        `[kv] refused write to "${key}": would drop ${destructive.existing} entries to ${destructive.incoming}`
+      );
+      res.status(409).json({
+        success: false,
+        conflict: true,
+        refused: 'mass-deletion',
+        ...destructive,
+        ...(await currentOf(key)),
+      });
+      return;
+    }
 
     if (!('version' in body)) {
       await prisma.kVStore.upsert({
