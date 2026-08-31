@@ -571,6 +571,10 @@ function mergeMetaWithDefaults(loaded){
 
   if(typeof merged.passcode === 'undefined') merged.passcode = null;
   if(!Array.isArray(merged.hiddenStages)) merged.hiddenStages = [];
+  // Seed rows deleted on purpose - see seedQuarter. Normalised here so a meta
+  // written before this existed doesn't come back as undefined and get treated
+  // as "nothing was ever deleted".
+  if(!Array.isArray(merged.removedSeedKeys)) merged.removedSeedKeys = [];
   if(!Array.isArray(merged.customRegions)) merged.customRegions = [];
   if(!merged.marketRegionOverrides || typeof merged.marketRegionOverrides !== 'object') merged.marketRegionOverrides = {};
   return merged;
@@ -601,19 +605,70 @@ async function seedQuarter(quarterName, seedArray, importedFlagKey){
     return;
   }
 
-  // Always merge in any seed rows not already present (matched by a
-  // content-based key, not a one-time flag) so new data added later keeps
-  // showing up automatically, without wiping or duplicating anything
-  // already saved or edited live.
-  const existingKeys = new Set(existingEntries.map(seedDedupeKey));
+  // Always merge in any seed rows not already present, so data added to the
+  // seed later keeps showing up automatically.
+  //
+  // Which seed rows count as "already present" is the whole difficulty. This
+  // used to match on seedDedupeKey alone, which is built out of the fields a
+  // person edits - title, date, name. So correcting a typo on a seeded row
+  // changed its key, the seed then found no row under the old key, and helpfully
+  // put the original back: the correction appeared to work, and a reload undid
+  // it by leaving both copies on screen. Deleting a seeded row had the same
+  // ending - gone until the next load, then back. Insights felt worst because
+  // all three of its seeded rows behave this way and it is the section people
+  // actually write in.
+  //
+  // So each seeded row is stamped with the identity of the seed row it came
+  // from, and that stamp - not the editable content - is what says "already
+  // present". Rows seeded before this existed get stamped on sight, matched the
+  // old way one last time.
   const now = Date.now();
+  const stampOf = (s) => s.id ? ('id:' + s.id) : ('key:' + seedDedupeKey(s));
+
+  const seedByStamp = new Map();
+  for(const s of seedArray) if(!seedByStamp.has(stampOf(s))) seedByStamp.set(stampOf(s), s);
+
+  const presentStamps = new Set();
+  const existingKeys = new Set(existingEntries.map(seedDedupeKey));
+  const existingIds = new Set(existingEntries.map(e => e.id));
+  // Stamping only helps if it is written down. Applied in memory alone it was
+  // recomputed from scratch on every load, so a row was never stamped at the
+  // moment someone deleted it and the delete could not be remembered.
+  let stamped = 0;
+  for(const e of existingEntries){
+    if(e.seedKey){ presentStamps.add(e.seedKey); continue; }
+    // No stamp yet: fall back to how this used to be matched, and record the
+    // result so the next edit can't unstick it.
+    for(const [stamp, s] of seedByStamp){
+      if(presentStamps.has(stamp)) continue;
+      if((s.id && s.id === e.id) || seedDedupeKey(s) === seedDedupeKey(e)){
+        e.seedKey = stamp;
+        presentStamps.add(stamp);
+        stamped++;
+        break;
+      }
+    }
+  }
+
+  // Seed rows an editor deleted on purpose. Without this the seed simply puts
+  // them back, which reads as the delete button not working.
+  const removedSeed = new Set(Array.isArray(meta.removedSeedKeys) ? meta.removedSeedKeys : []);
+
   const freshSeed = [];
   for(const s of seedArray){
-    const key = seedDedupeKey(s);
-    if(!existingKeys.has(key)){
-      freshSeed.push({id:uid(), ...s, createdAt:now, updatedAt:now});
-      existingKeys.add(key);
-    }
+    const stamp = stampOf(s);
+    if(presentStamps.has(stamp) || removedSeed.has(stamp)) continue;
+    // Belt and braces: 38 seed rows carry their own id, and `{id:uid(), ...s}`
+    // let that id win over the generated one - re-adding such a row produced
+    // two entries sharing an id, which then edit and delete as one.
+    if(s.id && existingIds.has(s.id)) continue;
+    if(existingKeys.has(seedDedupeKey(s))) continue;
+    const row = {id:uid(), ...s, seedKey:stamp, createdAt:now, updatedAt:now};
+    if(s.id) row.id = s.id;
+    freshSeed.push(row);
+    presentStamps.add(stamp);
+    existingKeys.add(seedDedupeKey(s));
+    existingIds.add(row.id);
   }
   meta[importedFlagKey] = now;
 
@@ -763,7 +818,7 @@ async function seedQuarter(quarterName, seedArray, importedFlagKey){
 
   qdataCache[quarterName] = { entries: [...existingEntries, ...freshSeed] };
 
-  if(freshSeed.length || refreshed){
+  if(freshSeed.length || refreshed || stamped){
     saveQData(quarterName).catch(()=>{});
   }
 }
@@ -3513,6 +3568,16 @@ function bindEvents(){
       const ok = await customConfirm("Delete this entry?");
       if(!ok) return;
       const data = await loadQData(state.quarter);
+      // A row that came from the seed has to be remembered as deleted, or the
+      // next page load seeds it straight back and the delete looks broken.
+      const doomed = data.entries.find(e=>e.id===b.dataset.id);
+      if(doomed && doomed.seedKey){
+        if(!Array.isArray(meta.removedSeedKeys)) meta.removedSeedKeys = [];
+        if(!meta.removedSeedKeys.includes(doomed.seedKey)){
+          meta.removedSeedKeys.push(doomed.seedKey);
+          saveMeta().catch(()=>{});
+        }
+      }
       data.entries = data.entries.filter(e=>e.id!==b.dataset.id);
       await saveQData(state.quarter);
       render();
