@@ -93,13 +93,16 @@ export const callback = async (req: Request, res: Response): Promise<void> => {
 export const health = async (_req: Request, res: Response): Promise<void> => {
   const rec = await getStoredToken();
   if (!rec) {
-    res.json({ success: true, data: { connected: false } });
+    res.json({ success: true, data: { connected: false, syncEnabled: env.LINKEDIN_SYNC_ENABLED } });
     return;
   }
   res.json({
     success: true,
     data: {
       connected: true,
+      // Connected and allowed-to-write are separate states: the account can be
+      // linked while the dashboard is still entered by hand.
+      syncEnabled: env.LINKEDIN_SYNC_ENABLED,
       expiresAt: new Date(rec.expiresAt).toISOString(),
       expired: Date.now() >= rec.expiresAt,
       hasRefreshToken: !!rec.refreshToken,
@@ -111,6 +114,18 @@ export const health = async (_req: Request, res: Response): Promise<void> => {
 
 /** POST /api/linkedin/sync?quarter=JAS'26 — pull + write into the dashboard KV. */
 export const sync = async (req: Request, res: Response): Promise<void> => {
+  // Gated alongside the cron, so "LinkedIn does not write rows" holds with no
+  // exception for whoever finds this URL. Reading LinkedIn is still fine -
+  // /health and the OAuth flow are untouched.
+  if (!env.LINKEDIN_SYNC_ENABLED) {
+    res.status(409).json({
+      success: false,
+      error:
+        'LinkedIn sync is disabled: Social Performance is entered manually. ' +
+        'Set LINKEDIN_SYNC_ENABLED=true to allow it to write rows again.',
+    });
+    return;
+  }
   if (env.SYNC_SECRET && req.header('x-sync-secret') !== env.SYNC_SECRET) {
     res.status(401).json({ success: false, error: 'invalid or missing x-sync-secret' });
     return;

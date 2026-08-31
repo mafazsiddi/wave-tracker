@@ -42,7 +42,13 @@ export const runDailySync = async (req: Request, res: Response): Promise<void> =
     const perQ: any = { quarter: q };
     try { perQ.instantly = await syncInstantlyToQuarter(q); } catch (e: any) { perQ.instantly = { error: e.message?.slice(0, 140) }; }
     try { perQ.hubspot = await syncHubSpotToQuarter(q); } catch (e: any) { perQ.hubspot = { error: e.message?.slice(0, 140) }; }
-    try { perQ.linkedin = await syncLinkedInToQuarter(q); } catch (e: any) { perQ.linkedin = { error: e.message?.slice(0, 140) }; }
+    // Off by default - Social Performance is manually entered. See
+    // LINKEDIN_SYNC_ENABLED in config/env.ts.
+    if (env.LINKEDIN_SYNC_ENABLED) {
+      try { perQ.linkedin = await syncLinkedInToQuarter(q); } catch (e: any) { perQ.linkedin = { error: e.message?.slice(0, 140) }; }
+    } else {
+      perQ.linkedin = { skipped: 'LINKEDIN_SYNC_ENABLED is not true' };
+    }
 
     // Reconcile the per-entry projection against the blob it shadows.
     //

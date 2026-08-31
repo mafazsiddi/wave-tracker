@@ -50,6 +50,23 @@ const envSchema = z.object({
   LINKEDIN_CLIENT_ID: z.string().optional().default(''),
   LINKEDIN_CLIENT_SECRET: z.string().optional().default(''),
   LINKEDIN_REDIRECT_URI: z.string().optional().default(''),
+
+  // Whether LinkedIn may write rows into a quarter. Off.
+  //
+  // Marketing wants Social Performance to hold what the team entered, not a
+  // machine-generated row alongside it. LinkedIn's organic stats are
+  // Page-level rather than per-country, so a sync can only file them under
+  // "Unmapped (LinkedIn)" - a row nobody asked for, in a country that doesn't
+  // exist, mixed in with hand-checked numbers.
+  //
+  // A flag rather than deleted code: the connection, the OAuth flow and the
+  // health endpoint all still work, so re-enabling is one variable in Vercel
+  // rather than a revert. Set to "true" to turn writing back on.
+  LINKEDIN_SYNC_ENABLED: z
+    .string()
+    .optional()
+    .default('false')
+    .transform((v) => v.toLowerCase() === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);
