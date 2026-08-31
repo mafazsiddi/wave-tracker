@@ -3575,7 +3575,16 @@ function bindEvents(){
         if(!Array.isArray(meta.removedSeedKeys)) meta.removedSeedKeys = [];
         if(!meta.removedSeedKeys.includes(doomed.seedKey)){
           meta.removedSeedKeys.push(doomed.seedKey);
-          saveMeta().catch(()=>{});
+          // Record the tombstone BEFORE removing the row, and only continue if
+          // it actually saved. A delete whose tombstone was lost is a row that
+          // returns on the next load - precisely the behaviour this was added
+          // to end - so refusing out loud beats appearing to work.
+          const remembered = await saveMeta();
+          if(!remembered){
+            meta.removedSeedKeys = meta.removedSeedKeys.filter(k=>k!==doomed.seedKey);
+            await customAlert("Couldn't delete this row: the change didn't save, so it would have come back on the next reload. Please check your connection and try again.");
+            return;
+          }
         }
       }
       data.entries = data.entries.filter(e=>e.id!==b.dataset.id);
