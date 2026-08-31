@@ -7,6 +7,7 @@
  * created/updated; manual rows are never touched.
  */
 import prisma from '../config/database';
+import { quarterFromKey, projectQuarter } from './entryProjection.service';
 import { getCampaignAnalytics, InstantlyCampaignAnalytics } from './instantly.service';
 import { SyncMeta, buildCountryToGroup, inferCountryAndGroup } from './mapping.util';
 
@@ -31,7 +32,19 @@ async function readKV<T>(key: string, fallback: T): Promise<T> {
 }
 async function writeKV(key: string, value: unknown): Promise<void> {
   const v = JSON.stringify(value);
+  const quarter = quarterFromKey(key);
+  // Read back first so the projection below can be a delta rather than a
+  // rewrite of every row - this runs on a serverless cron against a database
+  // in another region, where ~1,500 upserts would not finish.
+  const previous = quarter ? (await prisma.kVStore.findUnique({ where: { key } }))?.value ?? null : null;
   await prisma.kVStore.upsert({ where: { key }, update: { value: v }, create: { key, value: v } });
+  if (quarter) {
+    try {
+      await projectQuarter(quarter, previous, v);
+    } catch (error: any) {
+      console.error(`[entry] projection failed for "${key}": ${error.message}`);
+    }
+  }
 }
 
 /** Map Instantly analytics onto the dashboard's performance_email field keys. */

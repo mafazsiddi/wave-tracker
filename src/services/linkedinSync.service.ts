@@ -12,6 +12,7 @@
  * Instantly's per-campaign rows.
  */
 import prisma from '../config/database';
+import { quarterFromKey, projectQuarter } from './entryProjection.service';
 import { getAdminOrganizations, getFollowerGains, getShareStats } from './linkedin.service';
 
 interface LinkedInTokenRecord {
@@ -46,7 +47,17 @@ async function readKV<T>(key: string, fallback: T): Promise<T> {
 }
 async function writeKV(key: string, value: unknown): Promise<void> {
   const v = JSON.stringify(value);
+  const quarter = quarterFromKey(key);
+  // Delta, not a full rewrite - see the same note in instantlySync.service.ts.
+  const previous = quarter ? (await prisma.kVStore.findUnique({ where: { key } }))?.value ?? null : null;
   await prisma.kVStore.upsert({ where: { key }, update: { value: v }, create: { key, value: v } });
+  if (quarter) {
+    try {
+      await projectQuarter(quarter, previous, v);
+    } catch (error: any) {
+      console.error(`[entry] projection failed for "${key}": ${error.message}`);
+    }
+  }
 }
 
 /**

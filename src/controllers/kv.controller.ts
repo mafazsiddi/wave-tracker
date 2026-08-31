@@ -3,6 +3,12 @@ import crypto from 'crypto';
 import prisma from '../config/database';
 import { env } from '../config/env';
 import { safeEqual } from '../utils/pin';
+import {
+  quarterFromKey,
+  projectQuarter,
+  checkProjection,
+  QDATA_PREFIX,
+} from '../services/entryProjection.service';
 
 /**
  * Key-value store backing the Wave Tracker frontend's window.storage.
@@ -201,6 +207,23 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       }
     };
 
+    /**
+     * Mirror the write into the per-entry table.
+     *
+     * Runs only after the real write has landed, and can never fail it: the
+     * projection is not read by anything yet, so a gap here costs a
+     * reconciliation, while an exception here would cost a save.
+     */
+    const projectAfterWrite = async (): Promise<void> => {
+      const quarter = quarterFromKey(key);
+      if (!quarter) return;
+      try {
+        await projectQuarter(quarter, existingRow?.value ?? null, value);
+      } catch (error: any) {
+        console.error(`[entry] projection failed for "${key}": ${error.message}`);
+      }
+    };
+
     // A write that names no version is a write that cannot say what it is
     // replacing, so it replaces everything. That escape hatch was left open for
     // callers predating the version check, and it is what a tab left open since
@@ -228,6 +251,7 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       // Caller believes this key is brand new; let the primary key enforce it.
       try {
         await prisma.kVStore.create({ data: { key, value } });
+        await projectAfterWrite();
         res.json({ success: true, version: versionOf(value) });
       } catch {
         res.status(409).json({ success: false, conflict: true, ...(await currentOf(key)) });
@@ -250,6 +274,7 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       return;
     }
     await snapshotPrevious();
+    await projectAfterWrite();
     res.json({ success: true, version: versionOf(value) });
   } catch (error: any) {
     res.status(400).json({ success: false, error: error.message });
@@ -308,6 +333,64 @@ export const getRevision = async (req: Request, res: Response): Promise<void> =>
       return;
     }
     res.json(revision);
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * GET /api/kv/projection/check -> per-quarter comparison of rows against blobs.
+ *
+ * The gate on the migration. The per-entry table is written on every save but
+ * read by nothing, and it stays that way until this reports `identical` for a
+ * quarter across a stretch of ordinary use. Read-only.
+ */
+export const projectionCheck = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const rows = await prisma.kVStore.findMany({
+      where: { key: { startsWith: QDATA_PREFIX } },
+      select: { key: true },
+    });
+    const quarters = rows.map((r) => r.key.slice(QDATA_PREFIX.length));
+    const checks = [];
+    for (const q of quarters) checks.push(await checkProjection(q));
+    res.json({
+      success: true,
+      allIdentical: checks.length > 0 && checks.every((c) => c.identical),
+      quarters: checks,
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * POST /api/kv/projection/backfill  body { pin }  ->  per-quarter delta
+ *
+ * Builds the per-entry rows from the blobs as they stand. Safe to re-run: it
+ * is a full reconcile, not an append, so running it twice changes nothing the
+ * second time. PIN-gated because it writes, even though it only writes to a
+ * table nothing reads yet.
+ */
+export const projectionBackfill = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const pin = typeof req.body?.pin === 'string' ? req.body.pin : '';
+    if (!safeEqual(pin, env.EDIT_PIN)) {
+      res.status(403).json({ success: false, error: 'wrong or missing edit PIN' });
+      return;
+    }
+    const rows = await prisma.kVStore.findMany({
+      where: { key: { startsWith: QDATA_PREFIX } },
+      select: { key: true, value: true },
+    });
+    const results = [];
+    for (const row of rows) {
+      const quarter = row.key.slice(QDATA_PREFIX.length);
+      // null previous = full pass, so this reconciles rather than appends.
+      const delta = await projectQuarter(quarter, null, row.value);
+      results.push({ ...delta, ...(await checkProjection(quarter)) });
+    }
+    res.json({ success: true, quarters: results });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }

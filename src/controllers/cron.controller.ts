@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { syncInstantlyToQuarter } from '../services/instantlySync.service';
 import { syncHubSpotToQuarter } from '../services/hubspotSync.service';
 import { syncLinkedInToQuarter } from '../services/linkedinSync.service';
+import { projectQuarter, checkProjection, QDATA_PREFIX } from '../services/entryProjection.service';
 
 async function activeQuarters(): Promise<string[]> {
   const row = await prisma.kVStore.findUnique({ where: { key: 'meta' } });
@@ -42,6 +43,26 @@ export const runDailySync = async (req: Request, res: Response): Promise<void> =
     try { perQ.instantly = await syncInstantlyToQuarter(q); } catch (e: any) { perQ.instantly = { error: e.message?.slice(0, 140) }; }
     try { perQ.hubspot = await syncHubSpotToQuarter(q); } catch (e: any) { perQ.hubspot = { error: e.message?.slice(0, 140) }; }
     try { perQ.linkedin = await syncLinkedInToQuarter(q); } catch (e: any) { perQ.linkedin = { error: e.message?.slice(0, 140) }; }
+
+    // Reconcile the per-entry projection against the blob it shadows.
+    //
+    // Every write already projects itself, so this should find nothing to do.
+    // It runs anyway because the projection is deliberately allowed to fail
+    // without failing the write that triggered it - which means drift is
+    // possible by design, and something has to close it. A full pass is
+    // idempotent, so the normal outcome is that it changes nothing and reports
+    // identical. `identical` going false here is the signal not to move the
+    // read path onto these rows yet.
+    try {
+      const row = await prisma.kVStore.findUnique({ where: { key: QDATA_PREFIX + q } });
+      if (row) {
+        await projectQuarter(q, null, row.value);
+        perQ.projection = await checkProjection(q);
+      }
+    } catch (e: any) {
+      perQ.projection = { error: e.message?.slice(0, 140) };
+    }
+
     results.push(perQ);
   }
 

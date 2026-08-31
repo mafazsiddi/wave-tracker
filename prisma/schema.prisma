@@ -43,3 +43,38 @@ model KVRevision {
 
   @@index([key, createdAt])
 }
+
+// One row per dashboard entry - the shape the quarter blob should have had.
+//
+// Storing a quarter as a single blob is what makes losing it possible: every
+// save rewrites all ~1,500 rows, so two people editing unrelated things collide
+// on everything, and one bad write takes out the lot. The version token, the
+// mass-deletion guard and KVRevision are all sandbags around that one choice.
+// A row per entry removes the collision instead of defending against it - two
+// editors touching different rows cannot conflict at all, and a sync can be
+// confined to its own rows by a WHERE clause rather than by convention.
+//
+// Right now this table is written but never read: the blob in KVStore is still
+// the source of truth, and this is kept alongside it until it can be shown to
+// reproduce that blob exactly. See entryProjection.service.ts.
+//
+// `data` holds the entry's full JSON so nothing is lost to a column list the
+// frontend outgrows; the columns beside it are denormalised copies, there to be
+// queried on. `ord` preserves the entry's position in the blob array, which the
+// UI relies on for ordering. Deletes are soft - a row that vanishes is the
+// thing that has repeatedly gone wrong here, so it stays recoverable.
+model Entry {
+  quarter   String
+  id        String
+  ord       Int
+  channel   String?
+  kind      String?
+  group     String?
+  country   String?
+  data      String
+  updatedAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  @@id([quarter, id])
+  @@index([quarter, deletedAt])
+}
