@@ -15,8 +15,9 @@ import { safeEqual } from '../utils/pin';
  * To stop that, a read hands back a `version` (an md5 of the stored value) and
  * a write may pass it back: the write then only lands if the stored value is
  * still the one the caller started from, and otherwise comes back 409 with the
- * current value so the caller can merge and retry. Writes that send no
- * `version` keep the old unconditional behaviour.
+ * current value so the caller can merge and retry. A write that sends no
+ * `version` at all is refused outright - it can only come from a page cached
+ * before the check existed, and it would overwrite the whole blob blindly.
  */
 
 const versionOf = (value: string): string =>
@@ -163,9 +164,9 @@ const wouldDestroyData = (
 };
 
 // PUT /api/kv/:key
-//   body { value }                  -> unconditional write (legacy callers)
 //   body { value, version: string } -> only overwrites that exact version
 //   body { value, version: null }   -> only creates a key that doesn't exist yet
+//   body { value }                  -> refused: see below
 //   body { ..., allowShrink: true } -> opts out of the mass-deletion guard
 // 200 { success: true, version } on success, 409 { conflict: true, value, version } on a clash.
 export const putKV = async (req: Request, res: Response): Promise<void> => {
@@ -200,14 +201,26 @@ export const putKV = async (req: Request, res: Response): Promise<void> => {
       }
     };
 
+    // A write that names no version is a write that cannot say what it is
+    // replacing, so it replaces everything. That escape hatch was left open for
+    // callers predating the version check, and it is what a tab left open since
+    // two days earlier used to overwrite the live quarter with its own stale
+    // copy - erasing every row added in between, with a 200 back to a page that
+    // had no idea it had just destroyed anything.
+    //
+    // Nothing in this repo writes without a version any more; the only callers
+    // that still do are pages running JavaScript cached before the check
+    // existed. Those are exactly the writes that must not land. Refused the
+    // same way a version clash is, so a current page merges and retries, and a
+    // stale one surfaces its "could not save" toast instead of silently winning.
     if (!('version' in body)) {
-      await prisma.kVStore.upsert({
-        where: { key },
-        update: { value },
-        create: { key, value },
+      console.warn(`[kv] refused version-less write to "${key}" (stale client)`);
+      res.status(409).json({
+        success: false,
+        conflict: true,
+        refused: 'no-version',
+        ...(await currentOf(key)),
       });
-      await snapshotPrevious();
-      res.json({ success: true, version: versionOf(value) });
       return;
     }
 
