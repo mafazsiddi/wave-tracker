@@ -2,31 +2,49 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { env } from '../config/env';
 import { getAuthorizationUrl, exchangeCodeForToken, getAdminOrganizations } from '../services/linkedin.service';
-import { getStoredToken, storeToken, syncLinkedInToQuarter } from '../services/linkedinSync.service';
+import {
+  getStoredToken,
+  storeToken,
+  syncLinkedInToQuarter,
+  rememberState,
+  consumeState,
+} from '../services/linkedinSync.service';
 
-// In-memory CSRF state for the OAuth redirect — short-lived, single admin flow,
-// consistent with this internal tool's security posture (no user accounts).
-const pendingStates = new Map<string, number>();
-const STATE_TTL_MS = 10 * 60 * 1000;
-
-function newState(): string {
-  const s = crypto.randomBytes(16).toString('hex');
-  pendingStates.set(s, Date.now() + STATE_TTL_MS);
-  return s;
-}
-function consumeState(s: string): boolean {
-  const exp = pendingStates.get(s);
-  pendingStates.delete(s);
-  return !!exp && Date.now() < exp;
+/**
+ * The callback URL to hand LinkedIn, derived from the host this request came in
+ * on: localhost when run locally, the live domain when run on Vercel.
+ *
+ * A single configured value cannot be right in both places, and a wrong one
+ * fails late and unhelpfully - LinkedIn shows a generic error page at the
+ * consent screen, or, worse, authorize succeeds and the token exchange is
+ * rejected for a mismatch. Deriving it removes an environment variable that had
+ * to be remembered per deployment and could silently drift.
+ *
+ * Express is not behind `trust proxy` here, so `req.protocol` reports http even
+ * on HTTPS; the forwarded header is what Vercel actually sets. Falls back to
+ * https for anything that isn't localhost, since LinkedIn rejects plaintext
+ * redirect URLs anyway.
+ *
+ * env.LINKEDIN_REDIRECT_URI still wins when set, for a host this process cannot
+ * see itself. Whatever is used must be registered on the app's Auth tab.
+ */
+function redirectUriFor(req: Request): string {
+  if (env.LINKEDIN_REDIRECT_URI) return env.LINKEDIN_REDIRECT_URI;
+  const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:5000';
+  const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const proto = forwardedProto || (/^(localhost|127\.0\.0\.1)(:|$)/.test(host) ? 'http' : 'https');
+  return `${proto}://${host}/api/linkedin/callback`;
 }
 
 /** GET /api/linkedin/auth — redirect a Page admin through LinkedIn's OAuth consent screen. */
-export const auth = (_req: Request, res: Response): void => {
+export const auth = async (req: Request, res: Response): Promise<void> => {
   if (!env.LINKEDIN_CLIENT_ID || !env.LINKEDIN_CLIENT_SECRET) {
     res.status(500).send('LinkedIn is not configured: set LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET.');
     return;
   }
-  res.redirect(getAuthorizationUrl(newState()));
+  const state = crypto.randomBytes(16).toString('hex');
+  await rememberState(state);
+  res.redirect(getAuthorizationUrl(state, redirectUriFor(req)));
 };
 
 /** GET /api/linkedin/callback — exchange the code, look up admin orgs, store the token. */
@@ -36,7 +54,7 @@ export const callback = async (req: Request, res: Response): Promise<void> => {
     res.status(400).send(`LinkedIn declined: ${error} — ${error_description || ''}`);
     return;
   }
-  if (!state || !consumeState(state)) {
+  if (!state || !(await consumeState(state))) {
     res.status(401).send('LinkedIn callback rejected: missing or expired state (possible CSRF, or you took >10min to approve). Try /api/linkedin/auth again.');
     return;
   }
@@ -45,7 +63,9 @@ export const callback = async (req: Request, res: Response): Promise<void> => {
     return;
   }
   try {
-    const token = await exchangeCodeForToken(code);
+    // Must be byte-identical to the one sent to /authorization, or LinkedIn
+    // rejects the exchange - hence deriving it the same way from the same host.
+    const token = await exchangeCodeForToken(code, redirectUriFor(req));
     const orgUrns = await getAdminOrganizations(token.access_token);
     const now = Date.now();
     await storeToken({

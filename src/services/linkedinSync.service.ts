@@ -49,6 +49,37 @@ async function writeKV(key: string, value: unknown): Promise<void> {
   await prisma.kVStore.upsert({ where: { key }, update: { value: v }, create: { key, value: v } });
 }
 
+/**
+ * Pending OAuth CSRF states, kept in the database rather than in memory.
+ *
+ * On Vercel each request can land on a different function instance, so a state
+ * recorded when the admin hit /auth is very unlikely to still be in the process
+ * that serves /callback - the flow would reject every genuine attempt with
+ * "missing or expired state". Works locally, fails in production only.
+ */
+const STATE_KEY = 'linkedin:oauth-states';
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+export async function rememberState(state: string): Promise<void> {
+  const now = Date.now();
+  const states = await readKV<Record<string, number>>(STATE_KEY, {});
+  // Drop anything already expired on the way past, so this can't grow forever.
+  const live: Record<string, number> = { [state]: now + STATE_TTL_MS };
+  for (const [s, exp] of Object.entries(states)) if (exp > now) live[s] = exp;
+  await writeKV(STATE_KEY, live);
+}
+
+/** True if `state` was pending and unexpired. Single-use: it is consumed here. */
+export async function consumeState(state: string): Promise<boolean> {
+  const now = Date.now();
+  const states = await readKV<Record<string, number>>(STATE_KEY, {});
+  const exp = states[state];
+  delete states[state];
+  for (const [s, e] of Object.entries(states)) if (e <= now) delete states[s];
+  await writeKV(STATE_KEY, states);
+  return typeof exp === 'number' && exp > now;
+}
+
 export async function getStoredToken(): Promise<LinkedInTokenRecord | null> {
   return readKV<LinkedInTokenRecord | null>(TOKEN_KEY, null);
 }

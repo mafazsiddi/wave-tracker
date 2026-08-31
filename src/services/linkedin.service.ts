@@ -38,11 +38,17 @@ function linkedInVersion(): string {
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
-export function getAuthorizationUrl(state: string): string {
+/**
+ * `redirectUri` is passed in rather than read from config because LinkedIn
+ * requires the authorize call and the token exchange to send byte-identical
+ * values, and the right one depends on which host the admin started from.
+ * See redirectUriFor() in linkedin.controller.ts.
+ */
+export function getAuthorizationUrl(state: string, redirectUri: string): string {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: env.LINKEDIN_CLIENT_ID,
-    redirect_uri: env.LINKEDIN_REDIRECT_URI,
+    redirect_uri: redirectUri,
     state,
     scope: LINKEDIN_SCOPES.join(' '),
   });
@@ -57,13 +63,13 @@ export interface LinkedInTokenResponse {
   scope: string;
 }
 
-export async function exchangeCodeForToken(code: string): Promise<LinkedInTokenResponse> {
+export async function exchangeCodeForToken(code: string, redirectUri: string): Promise<LinkedInTokenResponse> {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
     client_id: env.LINKEDIN_CLIENT_ID,
     client_secret: env.LINKEDIN_CLIENT_SECRET,
-    redirect_uri: env.LINKEDIN_REDIRECT_URI,
+    redirect_uri: redirectUri,
   });
   const res = await fetch(`${AUTH_BASE}/accessToken`, {
     method: 'POST',
